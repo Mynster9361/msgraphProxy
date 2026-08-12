@@ -1,0 +1,142 @@
+{
+	"$schema": "https://raw.githubusercontent.com/dotnet/dev-proxy/refs/heads/main/schemas/v3.2.0/rc.schema.json",
+	"plugins": [
+		{
+			"name": "GraphMockResponsePlugin",
+			"enabled": true,
+			"pluginPath": "~appFolder/plugins/DevProxy.Plugins.dll",
+			"configSection": "mockResponsePlugin"
+		},
+		{
+			"name": "GraphSchemaMockPlugin",
+			"enabled": true,
+			"pluginPath": "~appFolder/plugins/DevProxy.Plugins.dll",
+			"configSection": "graphSchemaMockPlugin"
+		},
+		{
+			"name": "EntraTokenMockPlugin",
+			"enabled": true,
+			"pluginPath": "~appFolder/plugins/DevProxy.Plugins.dll",
+			"configSection": "entraTokenMockPlugin",
+			"urlsToWatch": [
+				"https://login.microsoftonline.com/*/oauth2/*"
+			]
+		},
+		{
+			"name": "GraphSelectGuidancePlugin",
+			"enabled": true,
+			"pluginPath": "~appFolder/plugins/DevProxy.Plugins.dll"
+		},
+		{
+			"name": "GraphBetaSupportGuidancePlugin",
+			"enabled": true,
+			"pluginPath": "~appFolder/plugins/DevProxy.Plugins.dll",
+			"urlsToWatch": [
+				"https://graph.microsoft.com/beta/*",
+				"https://graph.microsoft.us/beta/*",
+				"https://dod-graph.microsoft.us/beta/*",
+				"https://microsoftgraph.chinacloudapi.cn/beta/*"
+			]
+		},
+		{
+			"name": "GraphMinimalPermissionsPlugin",
+			"enabled": true,
+			"pluginPath": "~appFolder/plugins/DevProxy.Plugins.dll",
+			"configSection": "minimalPermissionsPlugin"
+		},
+		{
+			"name": "MinimalPermissionsGuidancePlugin",
+			"enabled": false,
+			"pluginPath": "~appFolder/plugins/DevProxy.Plugins.dll"
+		},
+		{
+			"name": "GraphConnectorGuidancePlugin",
+			"enabled": true,
+			"pluginPath": "~appFolder/plugins/DevProxy.Plugins.dll",
+			"urlsToWatch": [
+				"https://graph.microsoft.com/*/external/connections/*/schema",
+				"https://graph.microsoft.us/*/external/connections/*/schema",
+				"https://dod-graph.microsoft.us/*/external/connections/*/schema",
+				"https://microsoftgraph.chinacloudapi.cn/*/external/connections/*/schema"
+			]
+		},
+		{
+			"name": "GraphSdkGuidancePlugin",
+			"enabled": true,
+			"pluginPath": "~appFolder/plugins/DevProxy.Plugins.dll"
+		},
+		{
+			"name": "ODataPagingGuidancePlugin",
+			"enabled": true,
+			"pluginPath": "~appFolder/plugins/DevProxy.Plugins.dll"
+		},
+		{
+			"name": "GraphClientRequestIdGuidancePlugin",
+			"enabled": true,
+			"pluginPath": "~appFolder/plugins/DevProxy.Plugins.dll"
+		},
+		{
+			"name": "GraphRandomErrorPlugin",
+			"enabled": false,
+			"pluginPath": "~appFolder/plugins/DevProxy.Plugins.dll",
+			"configSection": "graphRandomErrorsPlugin"
+		},
+		{
+			"name": "ExecutionSummaryPlugin",
+			"enabled": false,
+			"pluginPath": "~appFolder/plugins/DevProxy.Plugins.dll",
+			"configSection": "executionSummaryPlugin"
+		},
+		{
+			"name": "JsonReporter",
+			"enabled": true,
+			"pluginPath": "~appFolder/plugins/DevProxy.Plugins.dll"
+		}
+	],
+	"urlsToWatch": [
+		"https://graph.microsoft.com/v1.0/*",
+		"https://graph.microsoft.com/beta/*",
+		"https://graph.microsoft.us/v1.0/*",
+		"https://graph.microsoft.us/beta/*",
+		"https://dod-graph.microsoft.us/v1.0/*",
+		"https://dod-graph.microsoft.us/beta/*",
+		"https://microsoftgraph.chinacloudapi.cn/v1.0/*",
+		"https://microsoftgraph.chinacloudapi.cn/beta/*",
+		"https://login.microsoftonline.com/*/oauth2/*"
+	],
+	"graphRandomErrorsPlugin": {
+		"allowedErrors": [
+			429,
+			500,
+			502,
+			503,
+			504,
+			507
+		]
+	},
+	"executionSummaryPlugin": {
+		"groupBy": "url"
+	},
+	"minimalPermissionsPlugin": {
+		"type": "application"
+	},
+	"mockResponsePlugin": {
+		"mocksFile": "mocks.json"
+	},
+	"graphSchemaMockPlugin": {
+		"schemaFilePath": "graph-schema/v1.0.csdl"
+	},
+	"entraTokenMockPlugin": {
+		"roles": [
+			"User.Read.All",
+			"Group.Read.All",
+			"Application.Read.All"
+		],
+		"scopes": [
+			"User.Read"
+		]
+	},
+	"rate": 0,
+	"labelMode": "text",
+	"logLevel": "information"
+}

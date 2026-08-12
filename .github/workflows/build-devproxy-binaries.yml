@@ -1,0 +1,36 @@
+name: Build Dev Proxy binaries
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'build/plugins-src/**'
+      - 'build/Build-DevProxyPackage.ps1'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build Dev Proxy packages
+        shell: pwsh
+        run: .\build\Build-DevProxyPackage.ps1 -Verbose
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "devproxy-$(Get-Date -Format yyyyMMdd-HHmmss)"
+          gh release create $tag .\package\*.zip --title $tag --notes "Automated Dev Proxy build with the msgraphProxy plugins (GraphSchemaMockPlugin, EntraTokenMockPlugin)."

@@ -1,0 +1,34 @@
+﻿on:
+  push:
+    branches:
+      - master
+      - main
+
+jobs:
+  build:
+
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install Prerequisites
+      run: .\build\psf-prerequisites.ps1
+      shell: pwsh
+    - name: Validate
+      run: .\build\vsts-validate.ps1
+      shell: pwsh
+    - name: Build
+      run: .\build\psf-build.ps1
+      shell: pwsh
+    - name: Publish
+      run: .\build\psf-publish.ps1 -ApiKey $env:APIKEY
+      shell: pwsh
+      env:
+        APIKEY: ${{ secrets.ApiKey }}
+    - name: Release
+      run: .\build\vsts-release.ps1
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

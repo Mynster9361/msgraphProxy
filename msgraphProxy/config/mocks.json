@@ -1,0 +1,4 @@
+{
+	"$schema": "https://raw.githubusercontent.com/dotnet/dev-proxy/refs/heads/main/schemas/v3.2.0/mockresponseplugin.mocksfile.schema.json",
+	"mocks": []
+}
