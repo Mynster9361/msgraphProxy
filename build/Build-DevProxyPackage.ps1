@@ -76,20 +76,60 @@ try {
 
     Write-Verbose 'Patching ProxyEngine.cs so installCert:false no longer breaks per-domain certificate generation'
     $proxyEngineFile = Join-Path -Path $cloneRoot -ChildPath 'DevProxy\Proxy\ProxyEngine.cs'
-    # Whitespace-tolerant (\s+ between tokens, Singleline so . spans the
-    # original's line breaks) rather than a literal block match - a literal
-    # multi-line here-string turned out to be sensitive to CRLF-vs-LF
+    $proxyEngineContent = Get-Content -Path $proxyEngineFile -Raw
+
+    # Each patch is whitespace-tolerant (\s+ between tokens, Singleline so .
+    # spans the original's line breaks) rather than a literal block match - a
+    # literal multi-line here-string turned out to be sensitive to CRLF-vs-LF
     # differences between this file and a freshly git-cloned copy, which
     # defeats the point of failing loudly instead of silently mismatching.
-    $pattern = [regex]::new(
-        '_explicitEndPoint\.GenericCertificate\s*=\s*await\s+ProxyServer\s*\.CertificateManager\s*\.LoadRootCertificateAsync\(stoppingToken\);',
-        [System.Text.RegularExpressions.RegexOptions]::Singleline)
-    $replacement = 'await ProxyServer.CertificateManager.LoadRootCertificateAsync(stoppingToken);'
-    $proxyEngineContent = Get-Content -Path $proxyEngineFile -Raw
-    if (-not $pattern.IsMatch($proxyEngineContent)) {
-        throw "Couldn't find the expected GenericCertificate assignment in ProxyEngine.cs to patch - upstream dev-proxy may have changed this file. Aborting rather than silently shipping a package with the broken certificate behavior."
+    # Every patch throws if its anchor text isn't found, rather than silently
+    # shipping a package with the original (broken, or undiagnosable) behavior
+    # if upstream dev-proxy has changed this file.
+    $patches = @(
+        [pscustomobject]@{
+            Label       = 'GenericCertificate assignment'
+            Pattern     = '_explicitEndPoint\.GenericCertificate\s*=\s*await\s+ProxyServer\s*\.CertificateManager\s*\.LoadRootCertificateAsync\(stoppingToken\);'
+            Replacement = 'await ProxyServer.CertificateManager.LoadRootCertificateAsync(stoppingToken);'
+        }
+        # Temporary diagnostic instrumentation, not a real fix: a real CI run
+        # showed Dev Proxy's control API (a separate hosted service) coming up
+        # fine while the proxy's own "Dev Proxy listening on ..." line - which
+        # only prints after this call and the AddEndPoint/StartAsync patch
+        # below - never appeared, and the actual proxy port then refused every
+        # connection. EnsureProxyServerInitialized is where the root CA gets
+        # generated (via a blocking JoinableTaskFactory.Run wrapper), so
+        # bracketing it pins down whether the hang is there specifically.
+        # Remove once the real CI run localizes the hang.
+        [pscustomobject]@{
+            Label       = 'EnsureProxyServerInitialized call'
+            Pattern     = '(?<indent>[ \t]*)EnsureProxyServerInitialized\(loggerFactory\);'
+            Replacement = "`${indent}Console.WriteLine(`"[msgraphProxy-diag] before EnsureProxyServerInitialized`");`n" +
+                          "`${indent}EnsureProxyServerInitialized(loggerFactory);`n" +
+                          "`${indent}Console.WriteLine(`"[msgraphProxy-diag] after EnsureProxyServerInitialized`");"
+        }
+        # Same reasoning as above: brackets the actual socket bind
+        # (AddEndPoint) and Titanium's own StartAsync, the two steps between
+        # cert setup and the "Dev Proxy listening on ..." log line.
+        [pscustomobject]@{
+            Label       = 'AddEndPoint/StartAsync call'
+            Pattern     = '(?<indent>[ \t]*)ProxyServer\.AddEndPoint\(_explicitEndPoint\);\s*await\s+ProxyServer\.StartAsync\(cancellationToken:\s*stoppingToken\);'
+            Replacement = "`${indent}Console.WriteLine(`"[msgraphProxy-diag] before AddEndPoint`");`n" +
+                          "`${indent}ProxyServer.AddEndPoint(_explicitEndPoint);`n" +
+                          "`${indent}Console.WriteLine(`"[msgraphProxy-diag] after AddEndPoint, before StartAsync`");`n" +
+                          "`${indent}await ProxyServer.StartAsync(cancellationToken: stoppingToken);`n" +
+                          "`${indent}Console.WriteLine(`"[msgraphProxy-diag] after StartAsync`");"
+        }
+    )
+
+    foreach ($patch in $patches) {
+        $regex = [regex]::new($patch.Pattern, [System.Text.RegularExpressions.RegexOptions]::Singleline)
+        if (-not $regex.IsMatch($proxyEngineContent)) {
+            throw "Couldn't find the expected $($patch.Label) in ProxyEngine.cs to patch - upstream dev-proxy may have changed this file. Aborting rather than silently shipping a package with the broken/undiagnosable certificate behavior."
+        }
+        $proxyEngineContent = $regex.Replace($proxyEngineContent, $patch.Replacement)
     }
-    $proxyEngineContent = $pattern.Replace($proxyEngineContent, $replacement)
+
     Set-Content -Path $proxyEngineFile -Value $proxyEngineContent -NoNewline
 
     foreach ($currentRid in $Rid) {
