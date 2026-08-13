@@ -8,6 +8,7 @@ on:
         paths:
             - "build/plugins-src/**"
             - "build/Build-DevProxyPackage.ps1"
+            - "build/Test-DevProxyPackage.ps1"
 
 jobs:
     build:
@@ -26,6 +27,10 @@ jobs:
             - name: Build Dev Proxy packages
               shell: pwsh
               run: .\build\Build-DevProxyPackage.ps1 -Verbose
+
+            - name: Smoke-test Dev Proxy package
+              shell: pwsh
+              run: .\build\Test-DevProxyPackage.ps1 -PackagePath .\package\msgraphproxy-devproxy-win-x64.zip
 
             - name: Publish release
               shell: pwsh
