@@ -57,6 +57,17 @@ if ($IsLinux) {
     & chmod +x (Join-Path -Path $ridRoot -ChildPath 'devproxy')
 }
 
+# The bundled devproxyrc.json doesn't override Dev Proxy's default proxy port
+# (8000 - distinct from the 8897 control-API port), so it's fixed here too.
+#
+# Test requests are pointed at this proxy explicitly via -Proxy, rather than
+# relying on Dev Proxy's system-wide proxy registration to propagate to this
+# process the way it does in normal interactive use - that registration is
+# Dev Proxy's own well-tested behavior, not something this script needs to
+# re-verify, and depending on it here made an earlier CI run's requests
+# silently reach the real graph.microsoft.com instead of the local mock.
+$proxyUri = 'http://127.0.0.1:8000'
+
 $failures = [System.Collections.Generic.List[string]]::new()
 
 function Test-Check {
@@ -120,6 +131,9 @@ function Wait-ProxyReady {
         [hashtable]
         $Headers,
 
+        [string]
+        $ProxyUri,
+
         [int]
         $TimeoutSeconds = 30
     )
@@ -128,7 +142,7 @@ function Wait-ProxyReady {
     $lastError = $null
     while ((Get-Date) -lt $deadline) {
         try {
-            Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/users' -Headers $Headers -SkipCertificateCheck -TimeoutSec 5 | Out-Null
+            Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/users' -Headers $Headers -Proxy $ProxyUri -SkipCertificateCheck -TimeoutSec 5 | Out-Null
             return
         } catch {
             $lastError = $_
@@ -151,60 +165,60 @@ try {
     Wait-ForControlApi -ApiPort $status.ApiPort
 
     $headers = @{ Authorization = 'Bearer faketoken' }
-    Wait-ProxyReady -Headers $headers
+    Wait-ProxyReady -Headers $headers -ProxyUri $proxyUri
 
     Test-Check 'GET /users returns a mocked collection' {
-        $r = Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/users' -Headers $headers -SkipCertificateCheck -TimeoutSec 15
+        $r = Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/users' -Headers $headers -Proxy $proxyUri -SkipCertificateCheck -TimeoutSec 15
         if ($r.value.Count -lt 1) { throw "expected at least 1 user, got $($r.value.Count)" }
     }
 
-    $userId = (Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/users' -Headers $headers -SkipCertificateCheck -TimeoutSec 15).value[0].id
+    $userId = (Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/users' -Headers $headers -Proxy $proxyUri -SkipCertificateCheck -TimeoutSec 15).value[0].id
 
     Test-Check 'GET /users/{id} returns the matching item' {
-        $r = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/$userId" -Headers $headers -SkipCertificateCheck -TimeoutSec 15
+        $r = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/$userId" -Headers $headers -Proxy $proxyUri -SkipCertificateCheck -TimeoutSec 15
         if ($r.id -ne $userId) { throw "expected id $userId, got $($r.id)" }
     }
 
     Test-Check 'POST .../members/$ref adds a reference (204)' {
         $body = @{ '@odata.id' = 'https://graph.microsoft.com/v1.0/directoryObjects/11111111-1111-1111-1111-111111111111' } | ConvertTo-Json
-        $r = Invoke-WebRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/groups/22222222-2222-2222-2222-222222222222/members/`$ref" -Headers $headers -Body $body -ContentType 'application/json' -SkipCertificateCheck -TimeoutSec 15
+        $r = Invoke-WebRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/groups/22222222-2222-2222-2222-222222222222/members/`$ref" -Headers $headers -Body $body -ContentType 'application/json' -Proxy $proxyUri -SkipCertificateCheck -TimeoutSec 15
         if ($r.StatusCode -ne 204) { throw "expected 204, got $($r.StatusCode)" }
     }
 
     Test-Check 'POST .../checkMemberGroups (bound Action) returns a value array' {
         $body = @{ groupIds = @('33333333-3333-3333-3333-333333333333') } | ConvertTo-Json
-        $r = Invoke-RestMethod -Method POST -Uri "https://graph.microsoft.com/v1.0/users/$userId/checkMemberGroups" -Headers $headers -Body $body -ContentType 'application/json' -SkipCertificateCheck -TimeoutSec 15
+        $r = Invoke-RestMethod -Method POST -Uri "https://graph.microsoft.com/v1.0/users/$userId/checkMemberGroups" -Headers $headers -Body $body -ContentType 'application/json' -Proxy $proxyUri -SkipCertificateCheck -TimeoutSec 15
         if (-not $r.value) { throw 'expected a value array in the response' }
     }
 
     Test-Check 'GET /applications/delta (bound Function) resolves' {
-        $r = Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/applications/delta' -Headers $headers -SkipCertificateCheck -TimeoutSec 15
+        $r = Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/applications/delta' -Headers $headers -Proxy $proxyUri -SkipCertificateCheck -TimeoutSec 15
         if (-not $r.value) { throw 'expected a value array in the response' }
     }
 
     Test-Check 'GET .../mail/$value returns raw text' {
-        $r = Invoke-WebRequest -Uri "https://graph.microsoft.com/v1.0/users/$userId/mail/`$value" -Headers $headers -SkipCertificateCheck -TimeoutSec 15
+        $r = Invoke-WebRequest -Uri "https://graph.microsoft.com/v1.0/users/$userId/mail/`$value" -Headers $headers -Proxy $proxyUri -SkipCertificateCheck -TimeoutSec 15
         if ($r.Headers['Content-Type'] -notlike 'text/plain*') { throw "expected text/plain, got $($r.Headers['Content-Type'])" }
     }
 
     Test-Check 'GET /users/$count returns a bare integer' {
-        $r = Invoke-WebRequest -Uri 'https://graph.microsoft.com/v1.0/users/$count' -Headers $headers -SkipCertificateCheck -TimeoutSec 15
+        $r = Invoke-WebRequest -Uri 'https://graph.microsoft.com/v1.0/users/$count' -Headers $headers -Proxy $proxyUri -SkipCertificateCheck -TimeoutSec 15
         if ($r.Content -notmatch '^\d+$') { throw "expected a bare integer, got '$($r.Content)'" }
     }
 
     Test-Check '$filter narrows results' {
-        $r = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users?`$filter=givenName eq 'Jane'" -Headers $headers -SkipCertificateCheck -TimeoutSec 15
+        $r = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users?`$filter=givenName eq 'Jane'" -Headers $headers -Proxy $proxyUri -SkipCertificateCheck -TimeoutSec 15
         if ($r.value.Count -ne 1) { throw "expected 1 result, got $($r.value.Count)" }
     }
 
     Test-Check '$expand surfaces a navigation property' {
-        $r = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/${userId}?`$expand=manager" -Headers $headers -SkipCertificateCheck -TimeoutSec 15
+        $r = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/${userId}?`$expand=manager" -Headers $headers -Proxy $proxyUri -SkipCertificateCheck -TimeoutSec 15
         if (-not $r.manager) { throw 'expected a manager property to be present' }
     }
 
     Test-Check 'POST .../oauth2/token (EntraTokenMockPlugin) issues a token' {
         $tokenBody = @{ client_id = 'test'; grant_type = 'client_credentials'; client_secret = 'test'; scope = 'https://graph.microsoft.com/.default' }
-        $r = Invoke-RestMethod -Method POST -Uri 'https://login.microsoftonline.com/common/oauth2/token' -Body $tokenBody -SkipCertificateCheck -TimeoutSec 15
+        $r = Invoke-RestMethod -Method POST -Uri 'https://login.microsoftonline.com/common/oauth2/token' -Body $tokenBody -Proxy $proxyUri -SkipCertificateCheck -TimeoutSec 15
         if (-not $r.access_token) { throw 'expected an access_token in the response' }
     }
 } finally {
