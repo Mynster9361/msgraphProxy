@@ -57,6 +57,27 @@ if ($IsLinux) {
     & chmod +x (Join-Path -Path $ridRoot -ChildPath 'devproxy')
 }
 
+# With installCert (Dev Proxy's default) true, Dev Proxy awaits trusting its
+# root CA into the OS store *before* it starts listening on its proxy port -
+# see ProxyEngine.ExecuteAsync in the dev-proxy source: AddEndPoint (which
+# binds the actual proxy listener) only runs after EnsureRootCertificateAsync
+# completes. In a non-interactive session that trust step never resolves (see
+# the cert-store notes further down), so the listener never binds at all -
+# the control API still responds fine since it's a separate host, but the
+# proxy port refuses every connection. This script already skips certificate
+# validation on its own requests, so it doesn't need Dev Proxy to have
+# trusted its cert - only to have started - hence installCert: false here,
+# via a copy of the bundled config rather than changing the real one, so real
+# end users still get the default (correct, if interactive) trust behavior.
+$originalConfigFile = & $module { $script:MsGraphProxyDefaultConfigFile }
+$configRoot = Split-Path -Path $originalConfigFile -Parent
+$testConfig = Get-Content -Raw -Path $originalConfigFile | ConvertFrom-Json -AsHashtable
+$testConfig['installCert'] = $false
+$testConfig['mockResponsePlugin']['mocksFile'] = Join-Path -Path $configRoot -ChildPath 'mocks.json'
+$testConfig['graphSchemaMockPlugin']['schemaFilePath'] = Join-Path -Path $configRoot -ChildPath 'graph-schema\v1.0.csdl'
+$testConfigFile = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath 'msgraphproxy-test-devproxyrc.json'
+$testConfig | ConvertTo-Json -Depth 10 | Set-Content -Path $testConfigFile
+
 # The bundled devproxyrc.json doesn't override Dev Proxy's default proxy port
 # (8000 - distinct from the 8897 control-API port), so it's fixed here too.
 #
@@ -155,7 +176,7 @@ function Wait-ProxyReady {
 
 try {
     Write-Host 'Starting Dev Proxy'
-    Start-MsGraphProxy -Confirm:$false | Out-Null
+    Start-MsGraphProxy -ConfigFile $testConfigFile -Confirm:$false | Out-Null
 
     $status = Get-MsGraphProxyStatus
     if (-not $status.Running) {
