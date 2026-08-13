@@ -34,7 +34,27 @@
 	
 	.PARAMETER Force
 		Start a new instance even if one is already tracked as running.
-	
+
+	.PARAMETER CI
+		Configure Dev Proxy for a non-interactive session (CI pipelines, Pester
+		runs, etc.) instead of normal interactive use. Certificate auto-install
+		is disabled in the launched config - with it left on, Dev Proxy awaits
+		an interactive OS confirmation dialog to trust its root CA before it
+		even starts listening, which never resolves non-interactively and
+		leaves the proxy port refusing every connection. Instead of relying on
+		Dev Proxy's system-wide proxy registration - Windows-only, and wasn't
+		reliably picked up by other processes in testing anyway - this sets
+		HTTP_PROXY/HTTPS_PROXY (and lowercase) for the current process, for
+		non-.NET child processes started later in this session, and directly
+		overrides [System.Net.Http.HttpClient]::DefaultProxy, since that's
+		lazily evaluated from the environment once and then cached - setting
+		the environment variables alone doesn't reliably reach PowerShell/.NET
+		code running in *this* process. The root certificate is then trusted
+		automatically via Install-MsGraphProxyCertificate on a best-effort
+		basis - see its help for what "best-effort" means here. The returned
+		object gains a CertificateTrusted property reflecting whether that
+		succeeded.
+
 	.PARAMETER WhatIf
 		If this switch is enabled, no actions are performed but informational
 		messages will be displayed that explain what would happen if the command
@@ -51,8 +71,15 @@
 	
 	.EXAMPLE
 		PS C:\> Start-MsGraphProxy -ConfigFile 'C:\proxy\devproxyrc.json' -ApiPort 9000
-	
+
 		Starts Dev Proxy with a custom configuration and control-API port.
+
+	.EXAMPLE
+		PS C:\> Start-MsGraphProxy -CI
+
+		Starts Dev Proxy configured for a CI pipeline: no certificate prompt to
+		block startup, HTTP_PROXY/HTTPS_PROXY set for the current process, and
+		its root certificate trusted automatically where possible.
 	#>
 	[CmdletBinding(SupportsShouldProcess)]
 	param (
@@ -66,7 +93,10 @@
 		$NoRecord,
 
 		[switch]
-		$Force
+		$Force,
+
+		[switch]
+		$CI
 	)
 
 	$existing = Get-MsGraphProxyStatus
@@ -89,6 +119,13 @@
 	} catch {
 		Write-Verbose 'Dev Proxy is not installed yet; installing it now.'
 		$exePath = Install-MsGraphProxy
+	}
+
+	$proxyPort = 8000
+	if ($CI) {
+		$ciConfig = New-MsGraphProxyCIConfigFile -ConfigFile $resolvedConfigFile
+		$resolvedConfigFile = $ciConfig.ConfigFile
+		$proxyPort = $ciConfig.ProxyPort
 	}
 
 	# Start-Process doesn't quote array elements containing spaces itself, so
@@ -117,5 +154,34 @@
 	} | ConvertTo-Json | Set-Content -Path $script:MsGraphProxyStateFile
 
 	Write-Verbose "Dev Proxy started (PID $($process.Id)) using $resolvedConfigFile"
-	Get-MsGraphProxyStatus
+
+	$result = Get-MsGraphProxyStatus
+	if ($CI) {
+		$proxyUri = "http://127.0.0.1:$proxyPort"
+		foreach ($name in 'HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy') {
+			[System.Environment]::SetEnvironmentVariable($name, $proxyUri, 'Process')
+		}
+
+		# The env vars above cover non-.NET child processes spawned later in
+		# this session (curl, Node, Python, etc. - each reads them fresh at
+		# its own startup). They're not enough on their own for .NET/PowerShell
+		# code running in *this* process, though: HttpClient.DefaultProxy is
+		# lazily evaluated from the environment once and then cached for the
+		# rest of the process - confirmed directly, setting the env vars alone
+		# still let a plain Invoke-RestMethod reach the real graph.microsoft.com
+		# instead of this proxy. Overriding DefaultProxy directly takes effect
+		# immediately regardless of that caching.
+		[System.Net.Http.HttpClient]::DefaultProxy = [System.Net.WebProxy]::new($proxyUri)
+
+		$certificateTrusted = $false
+		if (Wait-MsGraphProxyControlApi -ApiPort $ApiPort) {
+			$certificateTrusted = Install-MsGraphProxyCertificate -ApiPort $ApiPort
+		} else {
+			Write-Warning 'Dev Proxy did not become ready in time; skipping automatic certificate trust.'
+		}
+
+		$result = $result | Add-Member -NotePropertyName CertificateTrusted -NotePropertyValue $certificateTrusted -PassThru
+	}
+
+	$result
 }
