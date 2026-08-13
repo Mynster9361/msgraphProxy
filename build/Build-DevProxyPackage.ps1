@@ -9,20 +9,21 @@
     EntraTokenMockPlugin sources to it, publishes a self-contained build for
     each requested runtime identifier, and zips each one up.
 
-    Also patches one line in dev-proxy's own ProxyEngine.cs: with
-    installCert:false (which Start-MsGraphProxy -CI sets on Windows, to avoid
-    an interactive OS certificate-trust dialog blocking startup entirely),
-    dev-proxy's unpatched behavior assigns its root CA itself as a single
-    "generic" certificate served for every intercepted connection, instead of
-    generating a proper per-domain leaf certificate - confirmed directly via a
-    raw TLS handshake, which showed a served certificate of "CN=Dev Proxy CA"
-    rather than a leaf cert for the requested host, guaranteeing a hostname
-    mismatch for any client that actually validates it. The patch removes
-    that assignment so per-domain certificate generation always happens,
-    decoupled from whether the (Windows-only) OS-trust attempt runs. The
-    patch match is exact and this throws loudly if it doesn't find that exact
-    text, rather than silently building a package with the original broken
-    behavior if upstream dev-proxy has changed that file.
+    Also patches dev-proxy's own ProxyEngine.cs: with installCert:false (which
+    Start-MsGraphProxy -CI sets on Windows, to avoid an interactive OS
+    certificate-trust dialog blocking startup entirely), the underlying proxy
+    library (Unobtanium.Web.Proxy) independently calls its own OS-trust
+    routine from inside StartAsync() - unbounded, and the very thing
+    installCert:false exists to avoid - unless a certificate is already
+    assigned to the endpoint at that point. The patch clears that assignment
+    again immediately after StartAsync returns, so real proxy traffic still
+    gets a correct per-domain leaf certificate instead of one certificate
+    served for every host (confirmed directly via a raw TLS handshake this
+    used to break). See the inline comment at the patch site for the full
+    trail. The patch match is exact and this throws loudly if it doesn't find
+    that exact text, rather than silently building a package with broken or
+    undiagnosable certificate behavior if upstream dev-proxy has changed that
+    file.
 
     This always works against a fresh clone in the temp folder, so the
     original dev-proxy checkout on this machine, if any, is never touched.
@@ -74,7 +75,7 @@ try {
     $pluginsMockingDir = Join-Path -Path $cloneRoot -ChildPath 'DevProxy.Plugins\Mocking'
     Copy-Item -Path (Join-Path -Path $pluginsSourceRoot -ChildPath '*.cs') -Destination $pluginsMockingDir -Force
 
-    Write-Verbose 'Patching ProxyEngine.cs so installCert:false no longer breaks per-domain certificate generation'
+    Write-Verbose 'Patching ProxyEngine.cs so installCert:false no longer breaks per-domain certificate generation or hangs on Windows CI'
     $proxyEngineFile = Join-Path -Path $cloneRoot -ChildPath 'DevProxy\Proxy\ProxyEngine.cs'
     $proxyEngineContent = Get-Content -Path $proxyEngineFile -Raw
 
@@ -86,39 +87,34 @@ try {
     # Every patch throws if its anchor text isn't found, rather than silently
     # shipping a package with the original (broken, or undiagnosable) behavior
     # if upstream dev-proxy has changed this file.
+    #
+    # A single patch, not two: an earlier version of this removed the
+    # GenericCertificate assignment below outright (to fix
+    # RemoteCertificateNameMismatch - a permanently-assigned GenericCertificate
+    # makes Unobtanium serve that one cert for every host instead of
+    # generating a proper per-domain leaf cert, confirmed via a raw TLS
+    # handshake). That reintroduced a *different*, previously-unknown hang on
+    # Windows CI specifically, confirmed via diagnostic Console.WriteLine
+    # bracketing in a real CI run: ProxyServer.StartAsync() (Unobtanium's own
+    # code, not dev-proxy's) independently calls EnsureRootCertificateAsync -
+    # its OS-trust attempt, unbounded and identical to the interactive dialog
+    # installCert:false exists to avoid - whenever GenericCertificate is null
+    # at that point, regardless of dev-proxy's own installCert config.
+    # Leaving the assignment in place (as upstream already does) satisfies
+    # that internal check without hanging, and clearing it again immediately
+    # after StartAsync returns - before Unobtanium's async accept loop
+    # (BeginAcceptSocket) could possibly hand it a real connection - restores
+    # correct per-domain certificate generation for all actual proxy traffic.
     $patches = @(
-        [pscustomobject]@{
-            Label       = 'GenericCertificate assignment'
-            Pattern     = '_explicitEndPoint\.GenericCertificate\s*=\s*await\s+ProxyServer\s*\.CertificateManager\s*\.LoadRootCertificateAsync\(stoppingToken\);'
-            Replacement = 'await ProxyServer.CertificateManager.LoadRootCertificateAsync(stoppingToken);'
-        }
-        # Temporary diagnostic instrumentation, not a real fix: a real CI run
-        # showed Dev Proxy's control API (a separate hosted service) coming up
-        # fine while the proxy's own "Dev Proxy listening on ..." line - which
-        # only prints after this call and the AddEndPoint/StartAsync patch
-        # below - never appeared, and the actual proxy port then refused every
-        # connection. EnsureProxyServerInitialized is where the root CA gets
-        # generated (via a blocking JoinableTaskFactory.Run wrapper), so
-        # bracketing it pins down whether the hang is there specifically.
-        # Remove once the real CI run localizes the hang.
-        [pscustomobject]@{
-            Label       = 'EnsureProxyServerInitialized call'
-            Pattern     = '(?<indent>[ \t]*)EnsureProxyServerInitialized\(loggerFactory\);'
-            Replacement = "`${indent}Console.WriteLine(`"[msgraphProxy-diag] before EnsureProxyServerInitialized`");`n" +
-                          "`${indent}EnsureProxyServerInitialized(loggerFactory);`n" +
-                          "`${indent}Console.WriteLine(`"[msgraphProxy-diag] after EnsureProxyServerInitialized`");"
-        }
-        # Same reasoning as above: brackets the actual socket bind
-        # (AddEndPoint) and Titanium's own StartAsync, the two steps between
-        # cert setup and the "Dev Proxy listening on ..." log line.
         [pscustomobject]@{
             Label       = 'AddEndPoint/StartAsync call'
             Pattern     = '(?<indent>[ \t]*)ProxyServer\.AddEndPoint\(_explicitEndPoint\);\s*await\s+ProxyServer\.StartAsync\(cancellationToken:\s*stoppingToken\);'
-            Replacement = "`${indent}Console.WriteLine(`"[msgraphProxy-diag] before AddEndPoint`");`n" +
-                          "`${indent}ProxyServer.AddEndPoint(_explicitEndPoint);`n" +
-                          "`${indent}Console.WriteLine(`"[msgraphProxy-diag] after AddEndPoint, before StartAsync`");`n" +
+            Replacement = "`${indent}ProxyServer.AddEndPoint(_explicitEndPoint);`n" +
                           "`${indent}await ProxyServer.StartAsync(cancellationToken: stoppingToken);`n" +
-                          "`${indent}Console.WriteLine(`"[msgraphProxy-diag] after StartAsync`");"
+                          "`${indent}if (!_config.InstallCert)`n" +
+                          "`${indent}{`n" +
+                          "`${indent}    _explicitEndPoint.GenericCertificate = null;`n" +
+                          "`${indent}}"
         }
     )
 
