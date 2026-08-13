@@ -46,6 +46,8 @@ $module = Get-Module msgraphProxy
 $rid = & $module { Get-MsGraphProxyRid }
 $binRoot = & $module { $script:MsGraphProxyBinRoot }
 $ridRoot = Join-Path -Path $binRoot -ChildPath $rid
+$devProxyStdOutLog = & $module { $script:MsGraphProxyStdOutLog }
+$devProxyStdErrLog = & $module { $script:MsGraphProxyStdErrLog }
 
 Write-Host "Installing $PackagePath as the $rid build"
 if (Test-Path -Path $ridRoot) {
@@ -201,6 +203,18 @@ try {
         Write-Host '  Skipping the fully-transparent-call check: certificate trust did not succeed in this run.' -ForegroundColor Yellow
     }
 } finally {
+    # Dev Proxy's own console output - the only way to see why it might have
+    # failed to bind its ports in the first place, since Start-Process is
+    # fire-and-forget and swallows that otherwise (see Start-MsGraphProxy's
+    # help). Dumped unconditionally, not just on failure, so a passing run
+    # still shows what a clean startup looks like for comparison.
+    foreach ($log in @($devProxyStdOutLog, $devProxyStdErrLog)) {
+        if (Test-Path -Path $log) {
+            Write-Host "`n--- $log ---"
+            Get-Content -Path $log | Write-Host
+        }
+    }
+
     Write-Host 'Stopping Dev Proxy'
     Stop-MsGraphProxy -Confirm:$false | Out-Null
 }

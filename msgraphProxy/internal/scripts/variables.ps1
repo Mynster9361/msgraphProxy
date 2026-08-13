@@ -17,6 +17,8 @@ $dataRoot = if ($IsWindows) {
 }
 $script:MsGraphProxyBinRoot = Join-Path -Path $dataRoot -ChildPath 'msgraphProxy' -AdditionalChildPath 'bin'
 $script:MsGraphProxyStateFile = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath 'msgraphproxy-module-state.json'
+$script:MsGraphProxyStdOutLog = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath 'msgraphproxy-devproxy-stdout.log'
+$script:MsGraphProxyStdErrLog = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath 'msgraphproxy-devproxy-stderr.log'
 $script:MsGraphProxyDefaultApiPort = 8897
 $script:MsGraphProxyGitHubRepo = 'Mynster9361/msgraphProxy'
 # $null on an unsupported OS rather than throwing here, so importing the module

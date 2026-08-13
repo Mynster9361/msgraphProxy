@@ -13,6 +13,12 @@
 		Recording starts automatically with the proxy, so Stop-MsGraphProxy can
 		stop it again and return the resulting reports (such as minimal Graph
 		permissions) as an object. Pass -NoRecord to opt out.
+
+		Dev Proxy's own console output is redirected to
+		<temp>\msgraphproxy-devproxy-std{out,err}.log rather than left attached
+		to this session, since Start-Process is fire-and-forget - if Dev Proxy
+		exits or refuses to bind its ports right after starting, those files
+		are the only place to see why.
 	
 		Dev Proxy registers itself as the Windows system HTTP/HTTPS proxy while
 		running, so every proxy-aware application on the machine routes through
@@ -148,12 +154,23 @@
 		$processArgs += '--record'
 	}
 
+	# Redirected rather than left to inherit the console: Start-Process is
+	# fire-and-forget, so without this, a Dev Proxy process that crashes or
+	# refuses to bind its ports on startup leaves nothing behind to diagnose
+	# why - confirmed directly the hard way, when a CI run's control API and
+	# proxy port both refused every connection with no clue as to which of
+	# Dev Proxy's own startup steps never completed.
+	if (Test-Path -Path $script:MsGraphProxyStdOutLog) { Remove-Item -Path $script:MsGraphProxyStdOutLog -Force }
+	if (Test-Path -Path $script:MsGraphProxyStdErrLog) { Remove-Item -Path $script:MsGraphProxyStdErrLog -Force }
+
 	$params = @{
-		FilePath         = $exePath
-		ArgumentList     = $processArgs
-		WorkingDirectory = $(Split-Path -Path $exePath -Parent)
-		PassThru         = $true
-	} 
+		FilePath               = $exePath
+		ArgumentList           = $processArgs
+		WorkingDirectory       = $(Split-Path -Path $exePath -Parent)
+		PassThru               = $true
+		RedirectStandardOutput = $script:MsGraphProxyStdOutLog
+		RedirectStandardError  = $script:MsGraphProxyStdErrLog
+	}
 	$process = Start-Process @params
 
 	[pscustomobject]@{
