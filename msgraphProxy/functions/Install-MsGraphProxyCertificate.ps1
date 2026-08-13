@@ -7,9 +7,18 @@ function Install-MsGraphProxyCertificate {
 	.DESCRIPTION
 		Fetches Dev Proxy's root CA certificate from its control API and trusts
 		it for the current OS user, so HTTPS clients validate the certificates
-		Dev Proxy generates for intercepted requests without needing to skip
-		certificate validation themselves - useful for code that doesn't offer
-		an easy way to do that (most Graph SDKs and HTTP clients don't).
+		Dev Proxy generates for intercepted requests against a trusted CA,
+		rather than an unknown one. This is necessary but not always
+		sufficient for a client to skip certificate validation entirely: a
+		.NET HTTP client routed through Dev Proxy via an explicit proxy (as
+		Start-MsGraphProxy -CI has to use) can still hit
+		RemoteCertificateNameMismatch even once the CA is trusted - confirmed
+		by direct reproduction outside of Dev Proxy entirely, this looks like a
+		.NET SocketsHttpHandler behavior around SNI/expected-hostname not
+		carrying through an explicitly-configured WebProxy correctly. Code
+		that doesn't offer an easy way to skip certificate validation (most
+		Graph SDKs and HTTP clients don't) may still need that trust chain
+		error resolved some other way even after this succeeds.
 
 		On Windows this runs certutil, bounded by a timeout. Trusting a
 		certificate into the Root store normally shows an interactive

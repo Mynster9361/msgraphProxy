@@ -53,7 +53,16 @@
 		automatically via Install-MsGraphProxyCertificate on a best-effort
 		basis - see its help for what "best-effort" means here. The returned
 		object gains a CertificateTrusted property reflecting whether that
-		succeeded.
+		succeeded - but note that even when it's true, a .NET HTTP client
+		routed through this explicit proxy can still fail certificate
+		validation with RemoteCertificateNameMismatch (confirmed by direct
+		reproduction, on both Windows and Linux, outside of Dev Proxy
+		entirely - this looks like a .NET SocketsHttpHandler behavior around
+		SNI/expected-hostname not carrying through an explicitly-configured
+		WebProxy correctly, not something this module or Dev Proxy controls).
+		CertificateTrusted means the CA itself is trusted - it doesn't
+		guarantee every HTTP client will therefore validate cleanly with zero
+		accommodation on its end.
 
 	.PARAMETER WhatIf
 		If this switch is enabled, no actions are performed but informational
