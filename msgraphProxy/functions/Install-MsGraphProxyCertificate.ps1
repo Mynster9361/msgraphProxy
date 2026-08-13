@@ -12,19 +12,19 @@ function Install-MsGraphProxyCertificate {
 		an easy way to do that (most Graph SDKs and HTTP clients don't).
 
 		On Windows, trusting a certificate into the Root store normally shows an
-		interactive confirmation dialog - running certutil/Import-Certificate/
-		X509Store.Add() directly all hit it, confirmed to hang rather than fail
-		fast even in a genuinely non-interactive CI session. On an elevated
-		session this first tries running certutil via a one-off Scheduled Task
-		registered with an explicit S4U logon (confirmed to need elevation -
-		registering one without it fails outright with Access Denied, which is
-		exactly why this is only attempted when elevated): an S4U logon has no
-		window station attached at all, so there's nothing for the dialog to
-		attach to. GitHub Actions' Windows runners run elevated by default, so
-		this is expected to help there specifically; on a normal (non-elevated)
-		interactive desktop it's skipped and this falls back to running certutil
-		directly, bounded by a timeout, in case that dialog is shown and nothing
-		can answer it - this returns $false with a warning instead of hanging
+		interactive confirmation dialog. certutil and raw X509Store.Add() both
+		show a real, hangable dialog for it on an interactive session, and a
+		Scheduled Task registered with an explicit S4U logon (which has no
+		window station attached at all) didn't avoid that in real CI testing
+		either. Import-Certificate behaves differently, though: on an
+		interactive session it fails immediately ("UI is not allowed in this
+		operation") rather than showing anything, which is worth trying first -
+		a clean fast failure is cheap, and it may behave differently again (or
+		even succeed) in a genuinely non-interactive session, which is worth
+		confirming for real rather than assumed. It still runs in a background
+		job bounded by a timeout regardless, in case that assumption doesn't
+		hold either. Falls back to certutil directly (also bounded) if that
+		doesn't pan out - this returns $false with a warning instead of hanging
 		forever, either way.
 		On Linux, the certificate is copied into the system trust store and
 		update-ca-certificates is run (via sudo unless already running as
@@ -68,38 +68,28 @@ function Install-MsGraphProxyCertificate {
 	try {
 		if ($IsWindows) {
 			$trusted = $false
-			$isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
-			if ($isElevated) {
-				$taskName = "MsGraphProxyCertTrust_$([guid]::NewGuid().ToString('N'))"
-				try {
-					$action = New-ScheduledTaskAction -Execute 'certutil.exe' -Argument "-addstore -f -user Root `"$certPath`""
-					$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType S4U
-					Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -ErrorAction Stop | Out-Null
-					Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+			# Run via a background job so it's killable, not just fast in
+			# practice - this is exactly the kind of assumption ("it fails
+			# fast, so it can't hang") this module has been wrong about before.
+			$importJob = Start-Job -ScriptBlock {
+				param($Path)
+				Import-Certificate -FilePath $Path -CertStoreLocation 'Cert:\CurrentUser\Root' -ErrorAction Stop | Out-Null
+			} -ArgumentList $certPath
 
-					$deadline = (Get-Date).AddSeconds(15)
-					do {
-						Start-Sleep -Milliseconds 500
-						$info = Get-ScheduledTaskInfo -TaskName $taskName
-					} while ($info.LastTaskResult -eq 267009 -and (Get-Date) -lt $deadline)
-
-					$trusted = $info.LastTaskResult -eq 0
-					if (-not $trusted) {
-						Write-Verbose "Certificate trust via Scheduled Task didn't succeed (LastTaskResult: $($info.LastTaskResult)); falling back to a direct attempt."
-					}
-				} catch {
-					Write-Verbose "Certificate trust via Scheduled Task failed to even register/start ($_); falling back to a direct attempt."
-				} finally {
-					Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-				}
+			if ((Wait-Job -Job $importJob -Timeout 15) -and $importJob.State -eq 'Completed') {
+				$trusted = $true
+			} else {
+				$importError = Receive-Job -Job $importJob -ErrorAction SilentlyContinue 2>&1
+				Write-Verbose "Import-Certificate didn't trust the certificate (state: $($importJob.State), error: $importError); falling back to certutil."
 			}
+			Remove-Job -Job $importJob -Force -ErrorAction SilentlyContinue
 
 			if (-not $trusted) {
-				# Direct fallback: what's left once the Scheduled Task path is
-				# unavailable (not elevated) or didn't pan out. Bounded by a
-				# timeout since this is exactly the call expected to hit the
-				# interactive confirmation dialog in that case.
+				# Fallback: certutil directly, bounded by a timeout since this
+				# is exactly the call expected to hit the interactive
+				# confirmation dialog if Import-Certificate's fast-fail
+				# behavior doesn't translate into an actual successful trust.
 				$psi = [System.Diagnostics.ProcessStartInfo]::new('certutil.exe')
 				foreach ($arg in @('-addstore', '-f', '-user', 'Root', $certPath)) {
 					$psi.ArgumentList.Add($arg)
