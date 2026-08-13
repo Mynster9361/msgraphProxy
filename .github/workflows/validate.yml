@@ -1,4 +1,6 @@
-﻿on: [pull_request]
+﻿name: Build, test and validate module
+
+on: [pull_request]
 
 jobs:
     validate:

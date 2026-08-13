@@ -1,4 +1,6 @@
-﻿on:
+﻿name: Build and Release Powershell module
+
+on:
     push:
         branches:
             - master
