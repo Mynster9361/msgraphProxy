@@ -26,16 +26,29 @@ jobs:
               shell: pwsh
               run: .\build\Build-DevProxyPackage.ps1 -Verbose
 
-            - name: Smoke-test win-x64 package
-              shell: pwsh
-              run: .\build\Test-DevProxyPackage.ps1 -PackagePath .\package\msgraphproxy-devproxy-win-x64.zip
-
             - name: Upload packages
               uses: actions/upload-artifact@v7
               with:
                   name: devproxy-packages
                   path: package/*.zip
                   retention-days: 1
+
+    test-windows:
+        needs: build
+        runs-on: windows-latest
+
+        steps:
+            - uses: actions/checkout@v7
+
+            - name: Download packages
+              uses: actions/download-artifact@v8
+              with:
+                  name: devproxy-packages
+                  path: package
+
+            - name: Smoke-test win-x64 package
+              shell: pwsh
+              run: .\build\Test-DevProxyPackage.ps1 -PackagePath .\package\msgraphproxy-devproxy-win-x64.zip
 
     test-linux:
         needs: build
@@ -72,7 +85,7 @@ jobs:
               run: ./build/Test-DevProxyPackage.ps1 -PackagePath ./package/msgraphproxy-devproxy-osx-arm64.zip
 
     publish:
-        needs: [build, test-linux, test-macos]
+        needs: [build, test-windows, test-linux, test-macos]
         runs-on: windows-latest
         permissions:
             contents: write
