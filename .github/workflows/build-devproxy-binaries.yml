@@ -54,8 +54,25 @@ jobs:
               shell: pwsh
               run: ./build/Test-DevProxyPackage.ps1 -PackagePath ./package/msgraphproxy-devproxy-linux-x64.zip
 
+    test-macos:
+        needs: build
+        runs-on: macos-latest
+
+        steps:
+            - uses: actions/checkout@v7
+
+            - name: Download packages
+              uses: actions/download-artifact@v8
+              with:
+                  name: devproxy-packages
+                  path: package
+
+            - name: Smoke-test osx-arm64 package
+              shell: pwsh
+              run: ./build/Test-DevProxyPackage.ps1 -PackagePath ./package/msgraphproxy-devproxy-osx-arm64.zip
+
     publish:
-        needs: [build, test-linux]
+        needs: [build, test-linux, test-macos]
         runs-on: windows-latest
         permissions:
             contents: write

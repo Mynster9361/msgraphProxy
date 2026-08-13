@@ -53,7 +53,7 @@ if (Test-Path -Path $ridRoot) {
 }
 New-Item -Path $ridRoot -ItemType Directory -Force | Out-Null
 Expand-Archive -Path $PackagePath -DestinationPath $ridRoot -Force
-if ($IsLinux) {
+if ($IsLinux -or $IsMacOS) {
     & chmod +x (Join-Path -Path $ridRoot -ChildPath 'devproxy')
 }
 

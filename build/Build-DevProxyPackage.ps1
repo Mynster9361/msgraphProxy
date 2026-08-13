@@ -24,12 +24,16 @@
 .EXAMPLE
     PS C:\> .\build\Build-DevProxyPackage.ps1
 
-    Builds win-x64 and linux-x64 packages into .\package.
+    Builds win-x64, linux-x64 and osx-arm64 packages into .\package.
 #>
 [CmdletBinding()]
 param (
     [string[]]
-    $Rid = @('win-x64', 'linux-x64'),
+    # osx-x64 (Intel Mac) isn't included by default: GitHub Actions'
+    # macos-latest runners are Apple Silicon, so there's no CI coverage to
+    # verify an Intel build actually works - shipping it untested seemed
+    # worse than not shipping it. Pass it explicitly if you need it anyway.
+    $Rid = @('win-x64', 'linux-x64', 'osx-arm64'),
 
     [string]
     $Ref = 'main',

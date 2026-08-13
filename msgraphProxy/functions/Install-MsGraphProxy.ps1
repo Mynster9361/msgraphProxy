@@ -65,7 +65,7 @@
 	Expand-Archive -Path $zipPath -DestinationPath $ridRoot -Force
 	Remove-Item -Path $zipPath -Force
 
-	if ($IsLinux) {
+	if ($IsLinux -or $IsMacOS) {
 		& chmod +x $exePath
 	}
 

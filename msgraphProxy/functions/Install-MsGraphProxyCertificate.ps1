@@ -34,6 +34,14 @@ function Install-MsGraphProxyCertificate {
 		On Linux, the certificate is copied into the system trust store and
 		update-ca-certificates is run (via sudo unless already running as
 		root) - no interactive prompt is involved there.
+		On macOS this runs `security add-trusted-cert` against the current
+		user's login keychain (not the System keychain, so no sudo needed -
+		the same target Dev Proxy's own built-in MacCertificateHelper uses),
+		bounded by a timeout the same way as the Windows path: unlike Linux's
+		update-ca-certificates, keychain trust changes are known on some
+		macOS versions/headless setups to show a GUI authorization dialog,
+		and that risk hasn't been confirmed one way or the other in a real,
+		non-interactive CI run yet.
 
 		Returns $false rather than throwing when trust couldn't be established,
 		since this is inherently best-effort and callers - most commonly
@@ -57,8 +65,8 @@ function Install-MsGraphProxyCertificate {
 		$ApiPort = $script:MsGraphProxyDefaultApiPort
 	)
 
-	if (-not $IsWindows -and -not $IsLinux) {
-		Write-Warning 'Trusting the Dev Proxy root certificate automatically is only implemented for Windows and Linux.'
+	if (-not $IsWindows -and -not $IsLinux -and -not $IsMacOS) {
+		Write-Warning 'Trusting the Dev Proxy root certificate automatically is only implemented for Windows, Linux and macOS.'
 		return $false
 	}
 
@@ -92,7 +100,7 @@ function Install-MsGraphProxyCertificate {
 				Write-Warning "certutil failed to trust the Dev Proxy root certificate (exit $($process.ExitCode)): $errorOutput"
 				return $false
 			}
-		} else {
+		} elseif ($IsLinux) {
 			$isRoot = (& id -u) -eq '0'
 			$dest = '/usr/local/share/ca-certificates/msgraphproxy-devproxy.crt'
 			if ($isRoot) {
@@ -105,6 +113,28 @@ function Install-MsGraphProxyCertificate {
 
 			if ($LASTEXITCODE -ne 0) {
 				Write-Warning "update-ca-certificates failed (exit $LASTEXITCODE) to trust the Dev Proxy root certificate."
+				return $false
+			}
+		} else {
+			$keychain = Join-Path -Path $HOME -ChildPath 'Library/Keychains/login.keychain-db'
+			$psi = [System.Diagnostics.ProcessStartInfo]::new('security')
+			foreach ($arg in @('add-trusted-cert', '-r', 'trustRoot', '-k', $keychain, $certPath)) {
+				$psi.ArgumentList.Add($arg)
+			}
+			$psi.RedirectStandardOutput = $true
+			$psi.RedirectStandardError = $true
+			$psi.UseShellExecute = $false
+
+			$process = [System.Diagnostics.Process]::Start($psi)
+			if (-not $process.WaitForExit(15000)) {
+				$process.Kill()
+				Write-Warning 'Trusting the Dev Proxy root certificate timed out, likely waiting on a keychain authorization prompt that nothing could answer. HTTPS clients may need to skip certificate validation instead.'
+				return $false
+			}
+
+			if ($process.ExitCode -ne 0) {
+				$errorOutput = $process.StandardError.ReadToEnd()
+				Write-Warning "security failed to trust the Dev Proxy root certificate (exit $($process.ExitCode)): $errorOutput"
 				return $false
 			}
 		}
