@@ -11,21 +11,17 @@ function Install-MsGraphProxyCertificate {
 		certificate validation themselves - useful for code that doesn't offer
 		an easy way to do that (most Graph SDKs and HTTP clients don't).
 
-		On Windows, trusting a certificate into the Root store normally shows an
-		interactive confirmation dialog. certutil and raw X509Store.Add() both
-		show a real, hangable dialog for it on an interactive session, and a
-		Scheduled Task registered with an explicit S4U logon (which has no
-		window station attached at all) didn't avoid that in real CI testing
-		either. Import-Certificate behaves differently, though: on an
-		interactive session it fails immediately ("UI is not allowed in this
-		operation") rather than showing anything, which is worth trying first -
-		a clean fast failure is cheap, and it may behave differently again (or
-		even succeed) in a genuinely non-interactive session, which is worth
-		confirming for real rather than assumed. It still runs in a background
-		job bounded by a timeout regardless, in case that assumption doesn't
-		hold either. Falls back to certutil directly (also bounded) if that
-		doesn't pan out - this returns $false with a warning instead of hanging
-		forever, either way.
+		On Windows this runs certutil, bounded by a timeout. Trusting a
+		certificate into the Root store normally shows an interactive
+		confirmation dialog - confirmed, across several different approaches
+		(certutil, Import-Certificate, raw X509Store.Add(), a Scheduled Task
+		registered with an explicit S4U logon), that none of them avoid it in a
+		real, non-interactive GitHub Actions run; it consistently hangs rather
+		than failing fast there. The timeout means this degrades to returning
+		$false with a warning instead of hanging forever - which is the
+		expected, normal outcome in CI specifically, not just a fallback for
+		rare failures. It still works as intended on a genuine interactive
+		desktop session, where the dialog can actually be answered.
 		On Linux, the certificate is copied into the system trust store and
 		update-ca-certificates is run (via sudo unless already running as
 		root) - no interactive prompt is involved there.
@@ -67,49 +63,25 @@ function Install-MsGraphProxyCertificate {
 
 	try {
 		if ($IsWindows) {
-			$trusted = $false
-
-			# Run via a background job so it's killable, not just fast in
-			# practice - this is exactly the kind of assumption ("it fails
-			# fast, so it can't hang") this module has been wrong about before.
-			$importJob = Start-Job -ScriptBlock {
-				param($Path)
-				Import-Certificate -FilePath $Path -CertStoreLocation 'Cert:\CurrentUser\Root' -ErrorAction Stop | Out-Null
-			} -ArgumentList $certPath
-
-			if ((Wait-Job -Job $importJob -Timeout 15) -and $importJob.State -eq 'Completed') {
-				$trusted = $true
-			} else {
-				$importError = Receive-Job -Job $importJob -ErrorAction SilentlyContinue 2>&1
-				Write-Verbose "Import-Certificate didn't trust the certificate (state: $($importJob.State), error: $importError); falling back to certutil."
+			$psi = [System.Diagnostics.ProcessStartInfo]::new('certutil.exe')
+			foreach ($arg in @('-addstore', '-f', '-user', 'Root', $certPath)) {
+				$psi.ArgumentList.Add($arg)
 			}
-			Remove-Job -Job $importJob -Force -ErrorAction SilentlyContinue
+			$psi.RedirectStandardOutput = $true
+			$psi.RedirectStandardError = $true
+			$psi.UseShellExecute = $false
 
-			if (-not $trusted) {
-				# Fallback: certutil directly, bounded by a timeout since this
-				# is exactly the call expected to hit the interactive
-				# confirmation dialog if Import-Certificate's fast-fail
-				# behavior doesn't translate into an actual successful trust.
-				$psi = [System.Diagnostics.ProcessStartInfo]::new('certutil.exe')
-				foreach ($arg in @('-addstore', '-f', '-user', 'Root', $certPath)) {
-					$psi.ArgumentList.Add($arg)
-				}
-				$psi.RedirectStandardOutput = $true
-				$psi.RedirectStandardError = $true
-				$psi.UseShellExecute = $false
+			$process = [System.Diagnostics.Process]::Start($psi)
+			if (-not $process.WaitForExit(15000)) {
+				$process.Kill()
+				Write-Warning 'Trusting the Dev Proxy root certificate timed out, likely waiting on an interactive confirmation prompt that nothing could answer. HTTPS clients may need to skip certificate validation instead.'
+				return $false
+			}
 
-				$process = [System.Diagnostics.Process]::Start($psi)
-				if (-not $process.WaitForExit(15000)) {
-					$process.Kill()
-					Write-Warning 'Trusting the Dev Proxy root certificate timed out, likely waiting on an interactive confirmation prompt that nothing could answer. HTTPS clients may need to skip certificate validation instead.'
-					return $false
-				}
-
-				if ($process.ExitCode -ne 0) {
-					$errorOutput = $process.StandardError.ReadToEnd()
-					Write-Warning "certutil failed to trust the Dev Proxy root certificate (exit $($process.ExitCode)): $errorOutput"
-					return $false
-				}
+			if ($process.ExitCode -ne 0) {
+				$errorOutput = $process.StandardError.ReadToEnd()
+				Write-Warning "certutil failed to trust the Dev Proxy root certificate (exit $($process.ExitCode)): $errorOutput"
+				return $false
 			}
 		} else {
 			$isRoot = (& id -u) -eq '0'
