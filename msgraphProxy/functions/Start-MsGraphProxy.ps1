@@ -37,32 +37,35 @@
 
 	.PARAMETER CI
 		Configure Dev Proxy for a non-interactive session (CI pipelines, Pester
-		runs, etc.) instead of normal interactive use. Certificate auto-install
-		is disabled in the launched config - with it left on, Dev Proxy awaits
-		an interactive OS confirmation dialog to trust its root CA before it
-		even starts listening, which never resolves non-interactively and
-		leaves the proxy port refusing every connection. Instead of relying on
-		Dev Proxy's system-wide proxy registration - Windows-only, and wasn't
-		reliably picked up by other processes in testing anyway - this sets
-		HTTP_PROXY/HTTPS_PROXY (and lowercase) for the current process, for
-		non-.NET child processes started later in this session, and directly
-		overrides [System.Net.Http.HttpClient]::DefaultProxy, since that's
-		lazily evaluated from the environment once and then cached - setting
-		the environment variables alone doesn't reliably reach PowerShell/.NET
+		runs, etc.) instead of normal interactive use. On Windows, certificate
+		auto-install is disabled in the launched config - with it left on, Dev
+		Proxy awaits an interactive OS confirmation dialog to trust its root CA
+		before it even starts listening, which never resolves non-interactively
+		and leaves the proxy port refusing every connection. That's a
+		Windows-only risk (Dev Proxy only attempts OS trust automatically on
+		Windows to begin with), so Linux and macOS keep certificate
+		auto-install on - which also means they get Dev Proxy's normal,
+		correct per-domain certificate generation, unlike Windows: disabling
+		auto-install has a real side effect beyond skipping OS trust, covered
+		in Install-MsGraphProxyCertificate's help, that this module's build
+		pipeline patches around for Windows specifically.
+
+		Instead of relying on Dev Proxy's system-wide proxy registration -
+		Windows-only, and wasn't reliably picked up by other processes in
+		testing anyway - this sets HTTP_PROXY/HTTPS_PROXY (and lowercase) for
+		the current process, for non-.NET child processes started later in
+		this session, and directly overrides
+		[System.Net.Http.HttpClient]::DefaultProxy, since that's lazily
+		evaluated from the environment once and then cached - setting the
+		environment variables alone doesn't reliably reach PowerShell/.NET
 		code running in *this* process. The root certificate is then trusted
 		automatically via Install-MsGraphProxyCertificate on a best-effort
-		basis - see its help for what "best-effort" means here. The returned
-		object gains a CertificateTrusted property reflecting whether that
-		succeeded - but note that even when it's true, a .NET HTTP client
-		routed through this explicit proxy can still fail certificate
-		validation with RemoteCertificateNameMismatch (confirmed by direct
-		reproduction, on both Windows and Linux, outside of Dev Proxy
-		entirely - this looks like a .NET SocketsHttpHandler behavior around
-		SNI/expected-hostname not carrying through an explicitly-configured
-		WebProxy correctly, not something this module or Dev Proxy controls).
-		CertificateTrusted means the CA itself is trusted - it doesn't
-		guarantee every HTTP client will therefore validate cleanly with zero
-		accommodation on its end.
+		basis - see its help for what "best-effort" means here, particularly
+		on Windows. The returned object gains a CertificateTrusted property
+		reflecting whether that succeeded; confirmed end-to-end (including
+		through the Microsoft Graph PowerShell SDK's own HTTP client, not
+		just Invoke-RestMethod) that once it's true, HTTPS calls validate
+		cleanly with no client-side accommodation needed.
 
 	.PARAMETER WhatIf
 		If this switch is enabled, no actions are performed but informational

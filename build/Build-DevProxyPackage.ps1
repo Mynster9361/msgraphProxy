@@ -9,6 +9,21 @@
     EntraTokenMockPlugin sources to it, publishes a self-contained build for
     each requested runtime identifier, and zips each one up.
 
+    Also patches one line in dev-proxy's own ProxyEngine.cs: with
+    installCert:false (which Start-MsGraphProxy -CI sets on Windows, to avoid
+    an interactive OS certificate-trust dialog blocking startup entirely),
+    dev-proxy's unpatched behavior assigns its root CA itself as a single
+    "generic" certificate served for every intercepted connection, instead of
+    generating a proper per-domain leaf certificate - confirmed directly via a
+    raw TLS handshake, which showed a served certificate of "CN=Dev Proxy CA"
+    rather than a leaf cert for the requested host, guaranteeing a hostname
+    mismatch for any client that actually validates it. The patch removes
+    that assignment so per-domain certificate generation always happens,
+    decoupled from whether the (Windows-only) OS-trust attempt runs. The
+    patch match is exact and this throws loudly if it doesn't find that exact
+    text, rather than silently building a package with the original broken
+    behavior if upstream dev-proxy has changed that file.
+
     This always works against a fresh clone in the temp folder, so the
     original dev-proxy checkout on this machine, if any, is never touched.
 
@@ -58,6 +73,24 @@ try {
     Write-Verbose 'Adding msgraphProxy plugin sources'
     $pluginsMockingDir = Join-Path -Path $cloneRoot -ChildPath 'DevProxy.Plugins\Mocking'
     Copy-Item -Path (Join-Path -Path $pluginsSourceRoot -ChildPath '*.cs') -Destination $pluginsMockingDir -Force
+
+    Write-Verbose 'Patching ProxyEngine.cs so installCert:false no longer breaks per-domain certificate generation'
+    $proxyEngineFile = Join-Path -Path $cloneRoot -ChildPath 'DevProxy\Proxy\ProxyEngine.cs'
+    # Whitespace-tolerant (\s+ between tokens, Singleline so . spans the
+    # original's line breaks) rather than a literal block match - a literal
+    # multi-line here-string turned out to be sensitive to CRLF-vs-LF
+    # differences between this file and a freshly git-cloned copy, which
+    # defeats the point of failing loudly instead of silently mismatching.
+    $pattern = [regex]::new(
+        '_explicitEndPoint\.GenericCertificate\s*=\s*await\s+ProxyServer\s*\.CertificateManager\s*\.LoadRootCertificateAsync\(stoppingToken\);',
+        [System.Text.RegularExpressions.RegexOptions]::Singleline)
+    $replacement = 'await ProxyServer.CertificateManager.LoadRootCertificateAsync(stoppingToken);'
+    $proxyEngineContent = Get-Content -Path $proxyEngineFile -Raw
+    if (-not $pattern.IsMatch($proxyEngineContent)) {
+        throw "Couldn't find the expected GenericCertificate assignment in ProxyEngine.cs to patch - upstream dev-proxy may have changed this file. Aborting rather than silently shipping a package with the broken certificate behavior."
+    }
+    $proxyEngineContent = $pattern.Replace($proxyEngineContent, $replacement)
+    Set-Content -Path $proxyEngineFile -Value $proxyEngineContent -NoNewline
 
     foreach ($currentRid in $Rid) {
         Write-Verbose "Publishing devproxy for $currentRid"

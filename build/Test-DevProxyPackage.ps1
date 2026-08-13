@@ -181,19 +181,25 @@ try {
         if (-not $r.access_token) { throw 'expected an access_token in the response' }
     }
 
-    # Deliberately not testing a fully-flag-free call here even when
-    # CertificateTrusted is true: confirmed by direct reproduction (on both
-    # platforms, first-request, no prior state involved) that explicit-proxy
-    # routing - which -CI has to use, since neither env vars nor system-wide
-    # registration reliably reach the calling process's own HTTP client - hits
-    # RemoteCertificateNameMismatch even with a genuinely trusted CA. That
-    # looks like a .NET SocketsHttpHandler behavior around SNI/expected-host
-    # not carrying through an explicitly-configured WebProxy correctly, not a
-    # bug in this module or in Dev Proxy - it reproduces identically via the
-    # exact same explicit WebProxy override outside of Dev Proxy entirely.
-    # CertificateTrusted only claims the CA is trusted, not that every client
-    # will therefore validate cleanly - keeping a check here that's proven to
-    # fail deterministically whenever it would run isn't useful.
+    # The RemoteCertificateNameMismatch this used to hit unconditionally was
+    # traced to a real dev-proxy behavior (installCert:false assigns the root
+    # CA itself as a single "generic" certificate for every connection,
+    # instead of generating a proper per-domain leaf cert) and fixed by
+    # patching ProxyEngine.cs in Build-DevProxyPackage.ps1 - confirmed via a
+    # raw TLS handshake showing a correct per-host leaf cert afterward, and
+    # via this exact check passing end-to-end (including through the
+    # Microsoft Graph SDK's own HTTP client, not just Invoke-RestMethod).
+    # Still gated on CertificateTrusted, though: that's a separate, still
+    # best-effort concern (mainly on Windows, where the OS-trust attempt
+    # itself - not certificate generation - can time out non-interactively).
+    if ($ciResult.CertificateTrusted) {
+        Test-Check '-CI: fully transparent call succeeds (no -SkipCertificateCheck)' {
+            $r = Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/users' -Headers $headers -TimeoutSec 15
+            if ($r.value.Count -lt 1) { throw "expected at least 1 user, got $($r.value.Count)" }
+        }
+    } else {
+        Write-Host '  Skipping the fully-transparent-call check: certificate trust did not succeed in this run.' -ForegroundColor Yellow
+    }
 } finally {
     Write-Host 'Stopping Dev Proxy'
     Stop-MsGraphProxy -Confirm:$false | Out-Null

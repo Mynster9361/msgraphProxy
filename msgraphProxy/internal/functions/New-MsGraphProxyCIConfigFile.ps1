@@ -5,13 +5,32 @@ function New-MsGraphProxyCIConfigFile {
 		auto-install disabled.
 
 	.DESCRIPTION
-		With installCert true (Dev Proxy's default), Dev Proxy awaits trusting
-		its root CA into the OS certificate store before it starts listening on
-		its proxy port at all - fine on an interactive desktop, but that trust
-		step needs a confirmation dialog that never resolves in a non-interactive
-		CI session, so the proxy port never binds. Setting installCert to false
-		skips straight to loading the certificate without attempting OS trust,
-		which is what actually unblocks the proxy from starting in CI.
+		With installCert true (Dev Proxy's default) on Windows, Dev Proxy awaits
+		trusting its root CA into the OS certificate store before it starts
+		listening on its proxy port at all - fine on an interactive desktop, but
+		that trust step needs a confirmation dialog that never resolves in a
+		non-interactive CI session, so the proxy port never binds. Setting
+		installCert to false skips straight to loading the certificate without
+		attempting OS trust, which is what actually unblocks the proxy from
+		starting in CI - but it comes with a real cost, worth understanding: in
+		dev-proxy's own source (ProxyEngine.cs), the installCert:false branch
+		doesn't just skip OS trust, it also assigns the root CA itself as a
+		single "generic" certificate served for every intercepted connection,
+		bypassing normal per-domain certificate generation entirely - confirmed
+		directly via a raw TLS handshake, which showed a presented certificate
+		of "CN=Dev Proxy CA" instead of a leaf cert for the actual requested
+		host. Any client that validates hostnames will always reject that,
+		regardless of whether the CA itself is trusted.
+
+		The blocking OS-trust attempt this whole thing exists to avoid is
+		Windows-only (dev-proxy's ProxyServer is constructed with
+		userTrustRootCertificate: RunTime.IsWindows), so installCert only needs
+		to be forced false on Windows - Linux and macOS never had the deadlock
+		risk in the first place, and forcing it there too was needlessly giving
+		up correct per-domain certificate generation for no benefit. This
+		function now only overrides installCert on Windows; Linux and macOS get
+		the original config back unmodified (still copied alongside the
+		original file, so callers always get a predictable path/port back).
 
 		The copy is written into the same directory as the original config file,
 		not a temp directory - plugin settings like schemaFilePath/mocksFile are
@@ -36,7 +55,9 @@ function New-MsGraphProxyCIConfigFile {
 	)
 
 	$config = Get-Content -Raw -Path $ConfigFile | ConvertFrom-Json -AsHashtable
-	$config['installCert'] = $false
+	if ($IsWindows) {
+		$config['installCert'] = $false
+	}
 	$proxyPort = if ($config.ContainsKey('port')) { [int]$config['port'] } else { 8000 }
 
 	# No leading dot: Dev Proxy's config-file resolution fails to find a

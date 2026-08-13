@@ -8,17 +8,26 @@ function Install-MsGraphProxyCertificate {
 		Fetches Dev Proxy's root CA certificate from its control API and trusts
 		it for the current OS user, so HTTPS clients validate the certificates
 		Dev Proxy generates for intercepted requests against a trusted CA,
-		rather than an unknown one. This is necessary but not always
-		sufficient for a client to skip certificate validation entirely: a
-		.NET HTTP client routed through Dev Proxy via an explicit proxy (as
-		Start-MsGraphProxy -CI has to use) can still hit
-		RemoteCertificateNameMismatch even once the CA is trusted - confirmed
-		by direct reproduction outside of Dev Proxy entirely, this looks like a
-		.NET SocketsHttpHandler behavior around SNI/expected-hostname not
-		carrying through an explicitly-configured WebProxy correctly. Code
-		that doesn't offer an easy way to skip certificate validation (most
-		Graph SDKs and HTTP clients don't) may still need that trust chain
-		error resolved some other way even after this succeeds.
+		rather than an unknown one - confirmed end-to-end, including through
+		the Microsoft Graph PowerShell SDK's own HTTP client, that this is
+		sufficient on its own for a fully unmodified HTTPS call to validate
+		cleanly, no client-side accommodation (skipping certificate validation
+		or otherwise) needed.
+
+		That wasn't always true: with certificate auto-install disabled -
+		which Start-MsGraphProxy -CI does on Windows specifically, to avoid an
+		interactive OS confirmation dialog blocking startup entirely - Dev
+		Proxy's own unpatched behavior assigns its root CA itself as a single
+		"generic" certificate served for every intercepted connection, instead
+		of a proper per-domain leaf certificate, guaranteeing
+		RemoteCertificateNameMismatch for any client that validates hostnames,
+		regardless of whether the CA is trusted. Confirmed directly via a raw
+		TLS handshake showing a served certificate of "CN=Dev Proxy CA" rather
+		than a leaf cert for the requested host. This module's build pipeline
+		(Build-DevProxyPackage.ps1) now patches that one line out of Dev
+		Proxy's source so per-domain certificate generation always happens,
+		decoupled from whether the (Windows-only) OS-trust attempt runs -
+		trusting the CA via this function is genuinely sufficient now.
 
 		On Windows this runs certutil, bounded by a timeout. Trusting a
 		certificate into the Root store normally shows an interactive

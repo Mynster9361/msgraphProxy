@@ -1,0 +1,105 @@
+﻿# Demonstrates running Maester (https://maester.dev), a real, widely-used
+# Entra/M365 security-testing framework, against msgraphProxy's mock instead
+# of a real tenant - the flagship example of what this module is actually
+# for: letting a module/test author exercise real Graph-calling PowerShell
+# tooling in CI without a real app registration or tenant.
+#
+# IMPORTANT: results here reflect msgraphProxy's schema-accurate but entirely
+# FABRICATED data, not any real security posture. Confirmed by actually
+# running this: some Maester checks pass, some are sensibly skipped (e.g.
+# checks requiring an Entra ID P1/P2 license, since the mock doesn't model
+# licensing), some fail because fabricated cross-references naturally don't
+# line up (e.g. a policy "referencing" a group id that isn't the same
+# fabricated group another call returned), and a couple of checks bound to
+# very specific real-API response shapes (What-If evaluation results, in
+# particular) don't run cleanly against generic fabricated data. None of
+# that is a real security finding - this workflow deliberately does not
+# fail the build on Maester's own pass/fail results, only on the
+# proxy/connection/query plumbing itself failing outright.
+name: Maester example (against msgraphProxy mock)
+
+on:
+    workflow_dispatch:
+    push:
+        branches: ["main"]
+        paths:
+            - "msgraphProxy/**"
+            - "build/plugins-src/**"
+            - ".github/workflows/maester-example.yml"
+
+permissions:
+    contents: read
+
+jobs:
+    run-maester-against-mock:
+        name: Run Maester against the mock
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v7
+
+            - name: Start msgraphProxy in CI mode
+              shell: pwsh
+              run: |
+                  # Uses this repo's own module source directly, since this
+                  # workflow is exercising msgraphProxy's current code. A
+                  # real consumer in their own repo would instead run:
+                  #   Install-Module msgraphProxy -Scope CurrentUser -Force
+                  #   Import-Module msgraphProxy
+                  Import-Module ./msgraphProxy/msgraphProxy.psd1 -Force
+                  Install-MsGraphProxy
+                  $result = Start-MsGraphProxy -CI -Confirm:$false
+                  Write-Host "CertificateTrusted: $($result.CertificateTrusted)"
+
+            - name: Connect to the mock and run Maester
+              shell: pwsh
+              run: |
+                  Import-Module ./msgraphProxy/msgraphProxy.psd1 -Force
+                  Import-Module Microsoft.Graph.Authentication -Force
+
+                  # There's no real app registration to authenticate against -
+                  # EntraTokenMockPlugin issues a self-signed, well-formed JWT
+                  # for any client_id/secret, which is enough for the
+                  # Microsoft Graph PowerShell SDK to accept via -AccessToken.
+                  # (Connect-MgGraph -ClientSecretCredential also reaches the
+                  # mocked token endpoint successfully, but its underlying
+                  # MSAL token cache handling is unrelated to msgraphProxy and
+                  # wasn't reliable in testing - -AccessToken sidesteps that
+                  # entirely and is what's proven to work end-to-end.)
+                  $tokenBody = @{
+                      client_id     = 'test'
+                      grant_type    = 'client_credentials'
+                      client_secret = 'test'
+                      scope         = 'https://graph.microsoft.com/.default'
+                  }
+                  $tokenResponse = Invoke-RestMethod -Method POST -Uri 'https://login.microsoftonline.com/common/oauth2/token' -Body $tokenBody -TimeoutSec 15
+                  $secureToken = ConvertTo-SecureString $tokenResponse.access_token -AsPlainText -Force
+                  Connect-MgGraph -AccessToken $secureToken -NoWelcome
+
+                  Install-Module Maester -Scope CurrentUser -Force
+                  Import-Module Maester -Force
+                  Install-MaesterTests -Path ./tests
+
+                  $results = Invoke-Maester -OutputFolder test-results -OutputFolderFileName "test-results" -PassThru -NonInteractive
+
+                  $summary = Get-Content test-results/test-results.md
+                  Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary
+
+                  Write-Host "Total: $($results.TotalCount), Passed: $($results.PassedCount), Failed: $($results.FailedCount), Skipped: $($results.SkippedCount)"
+                  # Deliberately not failing the build on $results.Result here -
+                  # see the note at the top of this file for why that
+                  # wouldn't mean what it means against a real tenant.
+
+            - name: Stop msgraphProxy
+              if: always()
+              shell: pwsh
+              run: |
+                  Import-Module ./msgraphProxy/msgraphProxy.psd1 -Force
+                  Stop-MsGraphProxy -Confirm:$false
+
+            - name: Archive Maester test results
+              uses: actions/upload-artifact@v7
+              if: always()
+              with:
+                  name: maester-test-results
+                  path: test-results
