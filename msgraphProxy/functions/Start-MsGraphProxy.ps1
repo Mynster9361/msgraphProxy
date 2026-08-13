@@ -4,10 +4,11 @@
 		Starts the self-contained Dev Proxy build in its own process.
 	
 	.DESCRIPTION
-		Launches the cached Dev Proxy executable, installed via Install-MsGraphProxy,
-		against a devproxyrc.json configuration, and tracks the resulting process
-		so Stop-MsGraphProxy and Get-MsGraphProxyStatus can find it again later,
-		even from a different PowerShell session.
+		Launches the cached Dev Proxy executable against a devproxyrc.json
+		configuration, and tracks the resulting process so Stop-MsGraphProxy and
+		Get-MsGraphProxyStatus can find it again later, even from a different
+		PowerShell session. If Dev Proxy hasn't been installed yet for this OS,
+		it's installed automatically first (see Install-MsGraphProxy).
 	
 		Recording starts automatically with the proxy, so Stop-MsGraphProxy can
 		stop it again and return the resulting reports (such as minimal Graph
@@ -79,9 +80,15 @@
 	}
 	$resolvedConfigFile = (Resolve-Path -Path $ConfigFile).Path
 
-	$exePath = Get-MsGraphProxyExePath
 	if (-not $PSCmdlet.ShouldProcess('Dev Proxy', 'Start')) {
 		return
+	}
+
+	try {
+		$exePath = Get-MsGraphProxyExePath
+	} catch {
+		Write-Verbose 'Dev Proxy is not installed yet; installing it now.'
+		$exePath = Install-MsGraphProxy
 	}
 
 	# Start-Process doesn't quote array elements containing spaces itself, so

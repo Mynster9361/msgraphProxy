@@ -17,7 +17,7 @@
 	[CmdletBinding()]
 	param ()
 
-	$rid = Get-MsGraphProxyRid
+	$rid = $script:MsGraphProxyRid ?? (Get-MsGraphProxyRid)
 	$exeName = if ($IsWindows) { 'devproxy.exe' } else { 'devproxy' }
 	$ridRoot = Join-Path -Path $script:MsGraphProxyBinRoot -ChildPath $rid
 	$exePath = Join-Path -Path $ridRoot -ChildPath $exeName

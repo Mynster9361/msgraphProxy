@@ -32,7 +32,7 @@
 	[CmdletBinding()]
 	param (
 		[string]
-		$Rid = (Get-MsGraphProxyRid),
+		$Rid = ($script:MsGraphProxyRid ?? (Get-MsGraphProxyRid)),
 
 		[switch]
 		$Force
