@@ -11,12 +11,21 @@ function Install-MsGraphProxyCertificate {
 		certificate validation themselves - useful for code that doesn't offer
 		an easy way to do that (most Graph SDKs and HTTP clients don't).
 
-		On Windows this uses certutil, bounded by a timeout: trusting a
-		certificate into the Root store normally shows an interactive
-		confirmation dialog, which is expected to complete without one in a
-		non-interactive session (such as CI) - the timeout exists in case that
-		assumption doesn't hold and the dialog is shown but nothing can answer
-		it, so this returns $false with a warning instead of hanging forever.
+		On Windows, trusting a certificate into the Root store normally shows an
+		interactive confirmation dialog - running certutil/Import-Certificate/
+		X509Store.Add() directly all hit it, confirmed to hang rather than fail
+		fast even in a genuinely non-interactive CI session. On an elevated
+		session this first tries running certutil via a one-off Scheduled Task
+		registered with an explicit S4U logon (confirmed to need elevation -
+		registering one without it fails outright with Access Denied, which is
+		exactly why this is only attempted when elevated): an S4U logon has no
+		window station attached at all, so there's nothing for the dialog to
+		attach to. GitHub Actions' Windows runners run elevated by default, so
+		this is expected to help there specifically; on a normal (non-elevated)
+		interactive desktop it's skipped and this falls back to running certutil
+		directly, bounded by a timeout, in case that dialog is shown and nothing
+		can answer it - this returns $false with a warning instead of hanging
+		forever, either way.
 		On Linux, the certificate is copied into the system trust store and
 		update-ca-certificates is run (via sudo unless already running as
 		root) - no interactive prompt is involved there.
@@ -58,25 +67,59 @@ function Install-MsGraphProxyCertificate {
 
 	try {
 		if ($IsWindows) {
-			$psi = [System.Diagnostics.ProcessStartInfo]::new('certutil.exe')
-			foreach ($arg in @('-addstore', '-f', '-user', 'Root', $certPath)) {
-				$psi.ArgumentList.Add($arg)
-			}
-			$psi.RedirectStandardOutput = $true
-			$psi.RedirectStandardError = $true
-			$psi.UseShellExecute = $false
+			$trusted = $false
+			$isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
-			$process = [System.Diagnostics.Process]::Start($psi)
-			if (-not $process.WaitForExit(15000)) {
-				$process.Kill()
-				Write-Warning 'Trusting the Dev Proxy root certificate timed out, likely waiting on an interactive confirmation prompt that nothing could answer. HTTPS clients may need to skip certificate validation instead.'
-				return $false
+			if ($isElevated) {
+				$taskName = "MsGraphProxyCertTrust_$([guid]::NewGuid().ToString('N'))"
+				try {
+					$action = New-ScheduledTaskAction -Execute 'certutil.exe' -Argument "-addstore -f -user Root `"$certPath`""
+					$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType S4U
+					Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -ErrorAction Stop | Out-Null
+					Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+
+					$deadline = (Get-Date).AddSeconds(15)
+					do {
+						Start-Sleep -Milliseconds 500
+						$info = Get-ScheduledTaskInfo -TaskName $taskName
+					} while ($info.LastTaskResult -eq 267009 -and (Get-Date) -lt $deadline)
+
+					$trusted = $info.LastTaskResult -eq 0
+					if (-not $trusted) {
+						Write-Verbose "Certificate trust via Scheduled Task didn't succeed (LastTaskResult: $($info.LastTaskResult)); falling back to a direct attempt."
+					}
+				} catch {
+					Write-Verbose "Certificate trust via Scheduled Task failed to even register/start ($_); falling back to a direct attempt."
+				} finally {
+					Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+				}
 			}
 
-			if ($process.ExitCode -ne 0) {
-				$errorOutput = $process.StandardError.ReadToEnd()
-				Write-Warning "certutil failed to trust the Dev Proxy root certificate (exit $($process.ExitCode)): $errorOutput"
-				return $false
+			if (-not $trusted) {
+				# Direct fallback: what's left once the Scheduled Task path is
+				# unavailable (not elevated) or didn't pan out. Bounded by a
+				# timeout since this is exactly the call expected to hit the
+				# interactive confirmation dialog in that case.
+				$psi = [System.Diagnostics.ProcessStartInfo]::new('certutil.exe')
+				foreach ($arg in @('-addstore', '-f', '-user', 'Root', $certPath)) {
+					$psi.ArgumentList.Add($arg)
+				}
+				$psi.RedirectStandardOutput = $true
+				$psi.RedirectStandardError = $true
+				$psi.UseShellExecute = $false
+
+				$process = [System.Diagnostics.Process]::Start($psi)
+				if (-not $process.WaitForExit(15000)) {
+					$process.Kill()
+					Write-Warning 'Trusting the Dev Proxy root certificate timed out, likely waiting on an interactive confirmation prompt that nothing could answer. HTTPS clients may need to skip certificate validation instead.'
+					return $false
+				}
+
+				if ($process.ExitCode -ne 0) {
+					$errorOutput = $process.StandardError.ReadToEnd()
+					Write-Warning "certutil failed to trust the Dev Proxy root certificate (exit $($process.ExitCode)): $errorOutput"
+					return $false
+				}
 			}
 		} else {
 			$isRoot = (& id -u) -eq '0'
