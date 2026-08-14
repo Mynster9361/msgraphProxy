@@ -124,7 +124,8 @@
 		"mocksFile": "mocks.json"
 	},
 	"graphSchemaMockPlugin": {
-		"schemaFilePath": "graph-schema/v1.0.csdl"
+		"schemaFilePath": "graph-schema/v1.0.csdl",
+		"betaSchemaFilePath": "graph-schema/beta.csdl"
 	},
 	"entraTokenMockPlugin": {
 		"roles": [

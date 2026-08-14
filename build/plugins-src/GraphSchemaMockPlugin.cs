@@ -20,13 +20,18 @@ namespace DevProxy.Plugins.Mocking;
 public sealed class GraphSchemaMockPluginConfiguration
 {
     public string SchemaFilePath { get; set; } = "graph-schema/v1.0.csdl";
+    // Optional: if unset, or the file doesn't exist, /beta/* requests are simply
+    // left unmocked (falling through to whatever the next plugin/upstream does),
+    // same as this plugin's behavior before beta support existed.
+    public string? BetaSchemaFilePath { get; set; } = "graph-schema/beta.csdl";
 }
 
 /// <summary>
-/// Generates mock responses for any Microsoft Graph v1.0 endpoint by resolving
-/// the request path against the real CSDL schema (EntitySets, Singletons and
-/// NavigationProperties) and fabricating a schema-accurate object on the fly,
-/// instead of requiring a pre-authored fixture per endpoint.
+/// Generates mock responses for any Microsoft Graph v1.0 or beta endpoint by
+/// resolving the request path against the real CSDL schema for that version
+/// (EntitySets, Singletons and NavigationProperties) and fabricating a
+/// schema-accurate object on the fly, instead of requiring a pre-authored
+/// fixture per endpoint.
 /// </summary>
 public sealed class GraphSchemaMockPlugin(
     HttpClient httpClient,
@@ -42,7 +47,8 @@ public sealed class GraphSchemaMockPlugin(
         pluginConfigurationSection)
 {
     private const int MaxDepth = 3;
-    private const string VersionSegment = "/v1.0/";
+    private const string V1VersionSegment = "/v1.0/";
+    private const string BetaVersionSegment = "/beta/";
 
     private sealed class TypeDef
     {
@@ -57,6 +63,27 @@ public sealed class GraphSchemaMockPlugin(
         public required bool IsAction { get; init; }
         public required bool IsCollectionBound { get; init; }
         public string? ReturnType { get; init; }
+    }
+
+    // Everything parsed out of one CSDL file. v1.0 and beta each get their own
+    // instance - the two schemas can (and do) disagree about a type's shape, so
+    // resolving a request always has to go through exactly one of these, never a
+    // shared/mutable "current schema" field (this plugin's requests can run
+    // concurrently, so that would be a race condition).
+    private sealed class SchemaRegistry
+    {
+        public Dictionary<string, string> AliasMap { get; } = new(StringComparer.Ordinal);
+        public Dictionary<string, TypeDef> Types { get; } = new(StringComparer.Ordinal);
+        public Dictionary<string, List<string>> EnumTypes { get; } = new(StringComparer.Ordinal);
+        // Keyed by the resolved type each Function/Action's bindingParameter targets.
+        public Dictionary<string, List<FunctionActionDef>> FunctionsByBindingType { get; } = new(StringComparer.Ordinal);
+        public Dictionary<string, List<FunctionActionDef>> ActionsByBindingType { get; } = new(StringComparer.Ordinal);
+        // Keyed case-insensitively: Graph's URL routing (and thus segments typed by
+        // callers) is case-insensitive for entity set / singleton / navigation
+        // property names, e.g. "approleassignments" resolves the same as
+        // "appRoleAssignments" against the real service.
+        public Dictionary<string, string> EntitySets { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, string> Singletons { get; } = new(StringComparer.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -107,23 +134,16 @@ public sealed class GraphSchemaMockPlugin(
         ["department"] = () => "Engineering",
     };
 
-    private readonly Dictionary<string, string> _aliasMap = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, TypeDef> _registry = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, List<string>> _enumTypes = new(StringComparer.Ordinal);
-    // Keyed by the resolved type each Function/Action's bindingParameter targets.
-    private readonly Dictionary<string, List<FunctionActionDef>> _functionsByBindingType = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, List<FunctionActionDef>> _actionsByBindingType = new(StringComparer.Ordinal);
-    // Keyed case-insensitively: Graph's URL routing (and thus segments typed by
-    // callers) is case-insensitive for entity set / singleton / navigation
-    // property names, e.g. "approleassignments" resolves the same as
-    // "appRoleAssignments" against the real service.
-    private readonly Dictionary<string, string> _entitySets = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, string> _singletons = new(StringComparer.OrdinalIgnoreCase);
+    private SchemaRegistry _v1Registry = new();
+    private SchemaRegistry? _betaRegistry;
 
     // One shared pool of generated records per resolved type, seeded lazily on
     // first access and mutated by POST/PATCH/PUT/DELETE, so repeated requests
     // within a session see consistent, workable data instead of fresh random
-    // values every call.
+    // values every call. Shared across v1.0 and beta: they model the same
+    // underlying tenant data, just through differently-shaped API surfaces, so a
+    // record seeded via one version's schema is reused (and simply missing
+    // whichever properties are beta-only/v1.0-only) rather than kept separate.
     private readonly Dictionary<string, List<JsonObject>> _store = new(StringComparer.Ordinal);
 
     public override string Name => nameof(GraphSchemaMockPlugin);
@@ -141,18 +161,36 @@ public sealed class GraphSchemaMockPlugin(
             throw new FileNotFoundException($"Graph schema file '{schemaFilePath}' does not exist.", schemaFilePath);
         }
 
-        var csdl = await File.ReadAllTextAsync(schemaFilePath, cancellationToken);
-        ParseSchema(csdl);
+        _v1Registry = ParseSchema(await File.ReadAllTextAsync(schemaFilePath, cancellationToken));
+        LogRegistryLoaded(_v1Registry, "v1.0", schemaFilePath);
 
+        if (!string.IsNullOrWhiteSpace(Configuration.BetaSchemaFilePath))
+        {
+            var betaSchemaFilePath = ProxyUtils.GetFullPath(Configuration.BetaSchemaFilePath, ProxyConfiguration.ConfigFile);
+            if (File.Exists(betaSchemaFilePath))
+            {
+                _betaRegistry = ParseSchema(await File.ReadAllTextAsync(betaSchemaFilePath, cancellationToken));
+                LogRegistryLoaded(_betaRegistry, "beta", betaSchemaFilePath);
+            }
+            else
+            {
+                Logger.LogWarning("Beta Graph schema file '{BetaSchemaFilePath}' does not exist - /beta/* requests will not be mocked.", betaSchemaFilePath);
+            }
+        }
+    }
+
+    private void LogRegistryLoaded(SchemaRegistry registry, string version, string schemaFilePath)
+    {
         if (Logger.IsEnabled(LogLevel.Information))
         {
             Logger.LogInformation(
-                "{Name} loaded {EntityCount} entity types, {EnumCount} enums, {EntitySetCount} entity sets and {SingletonCount} singletons from {SchemaFilePath}",
+                "{Name} loaded {EntityCount} entity types, {EnumCount} enums, {EntitySetCount} entity sets and {SingletonCount} singletons for {Version} from {SchemaFilePath}",
                 Name,
-                _registry.Count,
-                _enumTypes.Count,
-                _entitySets.Count,
-                _singletons.Count,
+                registry.Types.Count,
+                registry.EnumTypes.Count,
+                registry.EntitySets.Count,
+                registry.Singletons.Count,
+                version,
                 schemaFilePath);
         }
     }
@@ -174,21 +212,22 @@ public sealed class GraphSchemaMockPlugin(
             return Task.CompletedTask;
         }
 
-        var path = request.RequestUri.AbsolutePath;
-        var versionIndex = path.IndexOf(VersionSegment, StringComparison.OrdinalIgnoreCase);
-        if (versionIndex < 0)
+        var (registry, versionSegment) = ResolveRegistry(request.RequestUri.AbsolutePath);
+        if (registry is null)
         {
             return Task.CompletedTask;
         }
 
-        var remainder = path[(versionIndex + VersionSegment.Length)..].Trim('/');
+        var path = request.RequestUri.AbsolutePath;
+        var versionIndex = path.IndexOf(versionSegment, StringComparison.OrdinalIgnoreCase);
+        var remainder = path[(versionIndex + versionSegment.Length)..].Trim('/');
         if (remainder.Length == 0)
         {
             return Task.CompletedTask;
         }
 
         var segments = remainder.Split('/', StringSplitOptions.RemoveEmptyEntries);
-        var resolved = ResolvePath(segments);
+        var resolved = ResolvePath(registry, segments);
         if (resolved is null)
         {
             Logger.LogRequest("No schema match for this path", MessageType.Skipped, new LoggingContext(e.Session));
@@ -198,19 +237,19 @@ public sealed class GraphSchemaMockPlugin(
         var node = resolved.Value;
         if (node.IsValue || node.IsCount)
         {
-            HandleRawSegment(node, method, request, e);
+            HandleRawSegment(registry, node, method, request, e);
             return Task.CompletedTask;
         }
 
         var (responseBody, statusCode) = node.IsRef
             ? HandleRef(node, method, request)
             : node.Operation is not null
-                ? (node.Operation.IsAction ? HandleAction(node.Operation, method, request) : HandleFunction(node.Operation, method, request))
+                ? (node.Operation.IsAction ? HandleAction(registry, node.Operation, method, request) : HandleFunction(registry, node.Operation, method, request))
                 : node.IsCollection
-                    ? HandleCollection(node.TypeFullName, method, request)
+                    ? HandleCollection(registry, versionSegment, node.TypeFullName, method, request)
                     : node.ItemId is not null
-                        ? HandleItem(node.TypeFullName, node.ItemId, method, request)
-                        : HandleSingleton(node.TypeFullName, method, request);
+                        ? HandleItem(registry, versionSegment, node.TypeFullName, node.ItemId, method, request)
+                        : HandleSingleton(registry, versionSegment, node.TypeFullName, method, request);
 
         if (statusCode is null)
         {
@@ -230,9 +269,26 @@ public sealed class GraphSchemaMockPlugin(
         return Task.CompletedTask;
     }
 
-    private (JsonNode? Body, HttpStatusCode? StatusCode) HandleCollection(string typeFullName, string method, Request request)
+    // v1.0 is checked first so a path containing both segments (never happens in
+    // practice, but not worth relying on) resolves deterministically.
+    private (SchemaRegistry? Registry, string VersionSegment) ResolveRegistry(string path)
     {
-        var pool = GetOrSeedPool(typeFullName);
+        if (path.Contains(V1VersionSegment, StringComparison.OrdinalIgnoreCase))
+        {
+            return (_v1Registry, V1VersionSegment);
+        }
+
+        if (_betaRegistry is not null && path.Contains(BetaVersionSegment, StringComparison.OrdinalIgnoreCase))
+        {
+            return (_betaRegistry, BetaVersionSegment);
+        }
+
+        return (null, "");
+    }
+
+    private (JsonNode? Body, HttpStatusCode? StatusCode) HandleCollection(SchemaRegistry registry, string versionSegment, string typeFullName, string method, Request request)
+    {
+        var pool = GetOrSeedPool(registry, typeFullName);
 
         if (method == "GET")
         {
@@ -251,21 +307,21 @@ public sealed class GraphSchemaMockPlugin(
                 filtered = filtered.Where(filterNode.Evaluate);
             }
 
-            var selectedProps = GetSelectedProps(typeFullName, request);
+            var selectedProps = GetSelectedProps(registry, typeFullName, request);
             var array = new JsonArray();
             foreach (var item in filtered)
             {
                 var trimmed = TrimTo(item, selectedProps);
-                ApplyExpand(trimmed, typeFullName, request);
+                ApplyExpand(registry, trimmed, typeFullName, request);
                 array.Add(trimmed);
             }
 
-            return (new JsonObject { ["@odata.context"] = BuildODataContext(request), ["value"] = array }, HttpStatusCode.OK);
+            return (new JsonObject { ["@odata.context"] = BuildODataContext(versionSegment, request), ["value"] = array }, HttpStatusCode.OK);
         }
 
         if (method == "POST")
         {
-            var created = BuildEntity(typeFullName);
+            var created = BuildEntity(registry, typeFullName);
             var bodyObj = ParseBody(request);
             if (bodyObj is not null)
             {
@@ -279,7 +335,7 @@ public sealed class GraphSchemaMockPlugin(
 
             pool.Add(created);
             var createdBody = created.DeepClone().AsObject();
-            createdBody["@odata.context"] = BuildODataContext(request) + "/$entity";
+            createdBody["@odata.context"] = BuildODataContext(versionSegment, request) + "/$entity";
             return (createdBody, HttpStatusCode.Created);
         }
 
@@ -298,11 +354,11 @@ public sealed class GraphSchemaMockPlugin(
     // object would try to add it again and fail with "member already
     // exists". Matching real Graph's shape avoids that and is simply more
     // schema-accurate besides.
-    private static string BuildODataContext(Request request)
+    private static string BuildODataContext(string versionSegment, Request request)
     {
         var path = request.RequestUri.AbsolutePath;
-        var versionIndex = path.IndexOf(VersionSegment, StringComparison.OrdinalIgnoreCase);
-        var remainder = versionIndex >= 0 ? path[(versionIndex + VersionSegment.Length)..].Trim('/') : "";
+        var versionIndex = path.IndexOf(versionSegment, StringComparison.OrdinalIgnoreCase);
+        var remainder = versionIndex >= 0 ? path[(versionIndex + versionSegment.Length)..].Trim('/') : "";
         var firstSegment = remainder.Split('/', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
         var parenIndex = firstSegment.IndexOf('(', StringComparison.Ordinal);
         if (parenIndex >= 0)
@@ -310,12 +366,12 @@ public sealed class GraphSchemaMockPlugin(
             firstSegment = firstSegment[..parenIndex];
         }
 
-        return $"{request.RequestUri.Scheme}://{request.RequestUri.Host}{VersionSegment}$metadata#{firstSegment}";
+        return $"{request.RequestUri.Scheme}://{request.RequestUri.Host}{versionSegment}$metadata#{firstSegment}";
     }
 
-    private (JsonNode? Body, HttpStatusCode? StatusCode) HandleItem(string typeFullName, string itemId, string method, Request request)
+    private (JsonNode? Body, HttpStatusCode? StatusCode) HandleItem(SchemaRegistry registry, string versionSegment, string typeFullName, string itemId, string method, Request request)
     {
-        var pool = GetOrSeedPool(typeFullName);
+        var pool = GetOrSeedPool(registry, typeFullName);
         var existing = FindById(pool, itemId);
 
         if (existing is null)
@@ -327,9 +383,9 @@ public sealed class GraphSchemaMockPlugin(
         {
             case "GET":
                 {
-                    var trimmed = TrimTo(existing, GetSelectedProps(typeFullName, request));
-                    ApplyExpand(trimmed, typeFullName, request);
-                    trimmed["@odata.context"] = BuildODataContext(request) + "/$entity";
+                    var trimmed = TrimTo(existing, GetSelectedProps(registry, typeFullName, request));
+                    ApplyExpand(registry, trimmed, typeFullName, request);
+                    trimmed["@odata.context"] = BuildODataContext(versionSegment, request) + "/$entity";
                     return (trimmed, HttpStatusCode.OK);
                 }
             case "DELETE":
@@ -351,14 +407,14 @@ public sealed class GraphSchemaMockPlugin(
         }
     }
 
-    private (JsonNode? Body, HttpStatusCode? StatusCode) HandleSingleton(string typeFullName, string method, Request request)
+    private (JsonNode? Body, HttpStatusCode? StatusCode) HandleSingleton(SchemaRegistry registry, string versionSegment, string typeFullName, string method, Request request)
     {
         if (method is not ("GET" or "PATCH" or "PUT"))
         {
             return (null, null);
         }
 
-        var pool = GetOrSeedPool(typeFullName);
+        var pool = GetOrSeedPool(registry, typeFullName);
         var record = pool[0];
 
         if (method is "PATCH" or "PUT")
@@ -370,9 +426,9 @@ public sealed class GraphSchemaMockPlugin(
             }
         }
 
-        var trimmedRecord = TrimTo(record, GetSelectedProps(typeFullName, request));
-        ApplyExpand(trimmedRecord, typeFullName, request);
-        trimmedRecord["@odata.context"] = BuildODataContext(request) + "/$entity";
+        var trimmedRecord = TrimTo(record, GetSelectedProps(registry, typeFullName, request));
+        ApplyExpand(registry, trimmedRecord, typeFullName, request);
+        trimmedRecord["@odata.context"] = BuildODataContext(versionSegment, request) + "/$entity";
         return (trimmedRecord, HttpStatusCode.OK);
     }
 
@@ -430,40 +486,40 @@ public sealed class GraphSchemaMockPlugin(
 
     // Bound Functions/Actions don't model their parameters, so request bodies and
     // parenthesized arguments are ignored - only the ReturnType shape is fabricated.
-    private (JsonNode? Body, HttpStatusCode? StatusCode) HandleFunction(FunctionActionDef op, string method, Request request)
+    private static (JsonNode? Body, HttpStatusCode? StatusCode) HandleFunction(SchemaRegistry registry, FunctionActionDef op, string method, Request request)
     {
         if (method != "GET")
         {
             return (null, null);
         }
 
-        return BuildOperationResult(op.ReturnType);
+        return BuildOperationResult(registry, op.ReturnType);
     }
 
-    private (JsonNode? Body, HttpStatusCode? StatusCode) HandleAction(FunctionActionDef op, string method, Request request)
+    private static (JsonNode? Body, HttpStatusCode? StatusCode) HandleAction(SchemaRegistry registry, FunctionActionDef op, string method, Request request)
     {
         if (method != "POST")
         {
             return (null, null);
         }
 
-        return BuildOperationResult(op.ReturnType);
+        return BuildOperationResult(registry, op.ReturnType);
     }
 
-    private (JsonNode? Body, HttpStatusCode? StatusCode) BuildOperationResult(string? returnType)
+    private static (JsonNode? Body, HttpStatusCode? StatusCode) BuildOperationResult(SchemaRegistry registry, string? returnType)
     {
         if (returnType is null)
         {
             return (null, HttpStatusCode.NoContent);
         }
 
-        var value = BuildValue(returnType, "value", 1);
+        var value = BuildValue(registry, returnType, "value", 1);
         return IsCollectionType(returnType)
             ? (new JsonObject { ["value"] = value }, HttpStatusCode.OK)
             : (value as JsonObject ?? new JsonObject { ["value"] = value }, HttpStatusCode.OK);
     }
 
-    private void HandleRawSegment(ResolvedNode node, string method, Request request, ProxyRequestArgs e)
+    private void HandleRawSegment(SchemaRegistry registry, ResolvedNode node, string method, Request request, ProxyRequestArgs e)
     {
         if (method != "GET")
         {
@@ -472,7 +528,7 @@ public sealed class GraphSchemaMockPlugin(
         }
 
         var rawBody = node.IsCount
-            ? GetOrSeedPool(node.TypeFullName).Count.ToString(CultureInfo.InvariantCulture)
+            ? GetOrSeedPool(registry, node.TypeFullName).Count.ToString(CultureInfo.InvariantCulture)
             : FakePrimitive(node.TypeFullName, node.PropName ?? "value")?.ToString() ?? "";
 
         e.Session.GenericResponse(rawBody, HttpStatusCode.OK, [new HttpHeader("Content-Type", "text/plain")]);
@@ -481,21 +537,21 @@ public sealed class GraphSchemaMockPlugin(
         Logger.LogRequest($"200 schema mock ({(node.IsCount ? "$count" : "$value")})", MessageType.Mocked, new LoggingContext(e.Session));
     }
 
-    private List<string> GetSelectedProps(string typeFullName, Request request)
+    private static List<string> GetSelectedProps(SchemaRegistry registry, string typeFullName, Request request)
     {
         var query = System.Web.HttpUtility.ParseQueryString(request.RequestUri.Query);
         var selectParam = query["$select"];
-        return selectParam is not null ? SplitSelect(selectParam) : DefaultProps(typeFullName);
+        return selectParam is not null ? SplitSelect(selectParam) : DefaultProps(registry, typeFullName);
     }
 
-    private List<JsonObject> GetOrSeedPool(string typeFullName)
+    private List<JsonObject> GetOrSeedPool(SchemaRegistry registry, string typeFullName)
     {
         if (_store.TryGetValue(typeFullName, out var pool))
         {
             return pool;
         }
 
-        var first = BuildEntity(typeFullName);
+        var first = BuildEntity(registry, typeFullName);
         var seeded = new List<JsonObject> { first, SecondSample(first, typeFullName) };
         _store[typeFullName] = seeded;
         return seeded;
@@ -545,16 +601,16 @@ public sealed class GraphSchemaMockPlugin(
 
     // --- Path resolution ---
 
-    private ResolvedNode? ResolvePath(string[] segments)
+    private static ResolvedNode? ResolvePath(SchemaRegistry registry, string[] segments)
     {
         ResolvedNode current;
-        if (_entitySets.TryGetValue(segments[0], out var entitySetType))
+        if (registry.EntitySets.TryGetValue(segments[0], out var entitySetType))
         {
-            current = new ResolvedNode(ResolveRefName(entitySetType), true, null);
+            current = new ResolvedNode(ResolveRefName(registry, entitySetType), true, null);
         }
-        else if (_singletons.TryGetValue(segments[0], out var singletonType))
+        else if (registry.Singletons.TryGetValue(segments[0], out var singletonType))
         {
-            current = new ResolvedNode(ResolveRefName(singletonType), false, null);
+            current = new ResolvedNode(ResolveRefName(registry, singletonType), false, null);
         }
         else
         {
@@ -590,7 +646,7 @@ public sealed class GraphSchemaMockPlugin(
                 // A collection-bound Function/Action (e.g. GET /applications/delta())
                 // always terminates the path - try it before assuming the segment is
                 // an item id, which is what every such segment resolved to before.
-                var collectionOp = TryMatchBoundOperation(current, segment);
+                var collectionOp = TryMatchBoundOperation(registry, current, segment);
                 if (collectionOp is not null)
                 {
                     return isLast ? current with { Operation = collectionOp } : null;
@@ -602,7 +658,7 @@ public sealed class GraphSchemaMockPlugin(
             }
 
             (string Name, string Type)? navMatch = null;
-            foreach (var nav in GetAllNavigationProperties(current.TypeFullName))
+            foreach (var nav in GetAllNavigationProperties(registry, current.TypeFullName))
             {
                 if (string.Equals(nav.Name, segment, StringComparison.OrdinalIgnoreCase))
                 {
@@ -616,7 +672,7 @@ public sealed class GraphSchemaMockPlugin(
                 // Try a singleton/item-bound Function/Action (e.g. .../{id}/checkMemberGroups)
                 // only after a real navigation property, so an existing nav-property route can
                 // never be shadowed by a same-named Function/Action.
-                var itemOp = TryMatchBoundOperation(current, segment);
+                var itemOp = TryMatchBoundOperation(registry, current, segment);
                 if (itemOp is not null)
                 {
                     return isLast ? current with { Operation = itemOp } : null;
@@ -625,7 +681,7 @@ public sealed class GraphSchemaMockPlugin(
                 // .../{property}/$value - the raw value of a scalar/stream property.
                 if (i == segments.Length - 2 && string.Equals(segments[i + 1], "$value", StringComparison.OrdinalIgnoreCase))
                 {
-                    var propMatch = GetAllProperties(current.TypeFullName)
+                    var propMatch = GetAllProperties(registry, current.TypeFullName)
                         .FirstOrDefault(p => string.Equals(p.Name, segment, StringComparison.OrdinalIgnoreCase) && p.Type.StartsWith("Edm.", StringComparison.Ordinal));
                     if (propMatch.Name is not null)
                     {
@@ -636,7 +692,7 @@ public sealed class GraphSchemaMockPlugin(
                 return null;
             }
 
-            current = new ResolvedNode(ResolveRefName(StripCollection(navMatch.Value.Type)), IsCollectionType(navMatch.Value.Type), null);
+            current = new ResolvedNode(ResolveRefName(registry, StripCollection(navMatch.Value.Type)), IsCollectionType(navMatch.Value.Type), null);
         }
 
         return current;
@@ -650,9 +706,9 @@ public sealed class GraphSchemaMockPlugin(
     private static bool IsCollectionType(string type) =>
         type.StartsWith("Collection(", StringComparison.Ordinal);
 
-    private string ResolveRefName(string rawRef)
+    private static string ResolveRefName(SchemaRegistry registry, string rawRef)
     {
-        foreach (var pair in _aliasMap)
+        foreach (var pair in registry.AliasMap)
         {
             if (rawRef.StartsWith(pair.Key + ".", StringComparison.Ordinal))
             {
@@ -665,24 +721,24 @@ public sealed class GraphSchemaMockPlugin(
 
     // --- Value generation ---
 
-    private JsonObject BuildEntity(string fullName) => BuildObject(fullName, 1);
+    private static JsonObject BuildEntity(SchemaRegistry registry, string fullName) => BuildObject(registry, fullName, 1);
 
-    private JsonObject BuildObject(string fullName, int depth)
+    private static JsonObject BuildObject(SchemaRegistry registry, string fullName, int depth)
     {
         var obj = new JsonObject();
-        foreach (var (name, type) in GetAllProperties(fullName))
+        foreach (var (name, type) in GetAllProperties(registry, fullName))
         {
-            obj[name] = BuildValue(type, name, depth);
+            obj[name] = BuildValue(registry, type, name, depth);
         }
 
         return obj;
     }
 
-    private JsonNode? BuildValue(string type, string propName, int depth)
+    private static JsonNode? BuildValue(SchemaRegistry registry, string type, string propName, int depth)
     {
         if (type.StartsWith("Collection(", StringComparison.Ordinal) && type.EndsWith(')'))
         {
-            var item = BuildValue(type[11..^1], propName, depth);
+            var item = BuildValue(registry, type[11..^1], propName, depth);
             var array = new JsonArray();
             if (item is not null)
             {
@@ -697,16 +753,16 @@ public sealed class GraphSchemaMockPlugin(
             return FakePrimitive(type, propName);
         }
 
-        var fullName = ResolveRefName(type);
+        var fullName = ResolveRefName(registry, type);
 
-        if (_enumTypes.TryGetValue(fullName, out var members))
+        if (registry.EnumTypes.TryGetValue(fullName, out var members))
         {
             return members.Count > 0 ? members[0] : "unknown";
         }
 
-        if (_registry.ContainsKey(fullName))
+        if (registry.Types.ContainsKey(fullName))
         {
-            return depth >= MaxDepth ? new JsonObject() : BuildObject(fullName, depth + 1);
+            return depth >= MaxDepth ? new JsonObject() : BuildObject(registry, fullName, depth + 1);
         }
 
         // Unresolved (rare cross-namespace edge case): best-effort string.
@@ -775,14 +831,14 @@ public sealed class GraphSchemaMockPlugin(
     private static List<string> SplitSelect(string select) =>
         [.. select.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)];
 
-    private List<string> DefaultProps(string fullName)
+    private static List<string> DefaultProps(SchemaRegistry registry, string fullName)
     {
         if (string.Equals(fullName, "microsoft.graph.user", StringComparison.Ordinal))
         {
             return [.. UserDefaultProperties];
         }
 
-        var scalarNames = GetAllProperties(fullName)
+        var scalarNames = GetAllProperties(registry, fullName)
             .Where(p => IsPrimitiveOrCollectionOfPrimitive(p.Type))
             .Select(p => p.Name)
             .Where(n => !string.Equals(n, "id", StringComparison.Ordinal))
@@ -823,7 +879,7 @@ public sealed class GraphSchemaMockPlugin(
     // after TrimTo, mutating the trimmed object: otherwise an expanded property
     // absent from $select/DefaultProps would immediately be stripped back out,
     // whereas real Graph always surfaces an expanded property regardless of $select.
-    private void ApplyExpand(JsonObject target, string typeFullName, Request request)
+    private static void ApplyExpand(SchemaRegistry registry, JsonObject target, string typeFullName, Request request)
     {
         var query = System.Web.HttpUtility.ParseQueryString(request.RequestUri.Query);
         var expandParam = query["$expand"];
@@ -832,7 +888,7 @@ public sealed class GraphSchemaMockPlugin(
             return;
         }
 
-        var navProps = GetAllNavigationProperties(typeFullName);
+        var navProps = GetAllNavigationProperties(registry, typeFullName);
         foreach (var raw in expandParam.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
             // Nested options, e.g. "manager($select=id,displayName)", aren't
@@ -855,7 +911,7 @@ public sealed class GraphSchemaMockPlugin(
             // wrong can't change which records match.
             if (match is not null)
             {
-                target[match.Value.Name] = BuildValue(match.Value.Type, match.Value.Name, 1);
+                target[match.Value.Name] = BuildValue(registry, match.Value.Type, match.Value.Name, 1);
             }
         }
     }
@@ -1078,8 +1134,9 @@ public sealed class GraphSchemaMockPlugin(
 
     // --- CSDL parsing ---
 
-    private void ParseSchema(string csdl)
+    private static SchemaRegistry ParseSchema(string csdl)
     {
+        var registry = new SchemaRegistry();
         var schemaStartRegex = new Regex(@"<Schema Namespace=""([^""]+)""(?:\s+Alias=""([^""]+)"")?[^>]*>", RegexOptions.None, TimeSpan.FromSeconds(30));
         var starts = schemaStartRegex.Matches(csdl);
 
@@ -1087,7 +1144,7 @@ public sealed class GraphSchemaMockPlugin(
         {
             if (s.Groups[2].Success)
             {
-                _aliasMap[s.Groups[2].Value] = s.Groups[1].Value;
+                registry.AliasMap[s.Groups[2].Value] = s.Groups[1].Value;
             }
         }
 
@@ -1098,32 +1155,34 @@ public sealed class GraphSchemaMockPlugin(
             var blockEnd = i + 1 < starts.Count ? starts[i + 1].Index : csdl.Length;
             var body = csdl[blockStart..blockEnd];
 
-            ParseTypeBlocks(namespaceName, body, "EntityType");
-            ParseTypeBlocks(namespaceName, body, "ComplexType");
-            ParseEnumBlocks(namespaceName, body);
-            ParseOperationBlocks(body, "Function", isAction: false);
-            ParseOperationBlocks(body, "Action", isAction: true);
+            ParseTypeBlocks(registry, namespaceName, body, "EntityType");
+            ParseTypeBlocks(registry, namespaceName, body, "ComplexType");
+            ParseEnumBlocks(registry, namespaceName, body);
+            ParseOperationBlocks(registry, body, "Function", isAction: false);
+            ParseOperationBlocks(registry, body, "Action", isAction: true);
         }
 
         var containerMatch = Regex.Match(csdl, @"<EntityContainer Name=""[^""]*"">(.*?)</EntityContainer>", RegexOptions.Singleline, TimeSpan.FromSeconds(30));
         if (!containerMatch.Success)
         {
-            return;
+            return registry;
         }
 
         var containerBody = containerMatch.Groups[1].Value;
         foreach (Match m in Regex.Matches(containerBody, @"<EntitySet Name=""([^""]+)"" EntityType=""([^""]+)"""))
         {
-            _entitySets[m.Groups[1].Value] = m.Groups[2].Value;
+            registry.EntitySets[m.Groups[1].Value] = m.Groups[2].Value;
         }
 
         foreach (Match m in Regex.Matches(containerBody, @"<Singleton Name=""([^""]+)"" Type=""([^""]+)"""))
         {
-            _singletons[m.Groups[1].Value] = m.Groups[2].Value;
+            registry.Singletons[m.Groups[1].Value] = m.Groups[2].Value;
         }
+
+        return registry;
     }
 
-    private void ParseTypeBlocks(string namespaceName, string body, string tagName)
+    private static void ParseTypeBlocks(SchemaRegistry registry, string namespaceName, string body, string tagName)
     {
         var pattern = $@"<{tagName} Name=""([^""]+)""(?:\s+BaseType=""([^""]+)"")?[^>]*?(?:/>|>(.*?)</{tagName}>)";
         foreach (Match m in Regex.Matches(body, pattern, RegexOptions.Singleline, TimeSpan.FromSeconds(30)))
@@ -1143,11 +1202,11 @@ public sealed class GraphSchemaMockPlugin(
                 def.NavigationProperties.Add((np.Groups[1].Value, np.Groups[2].Value));
             }
 
-            _registry[$"{namespaceName}.{name}"] = def;
+            registry.Types[$"{namespaceName}.{name}"] = def;
         }
     }
 
-    private void ParseEnumBlocks(string namespaceName, string body)
+    private static void ParseEnumBlocks(SchemaRegistry registry, string namespaceName, string body)
     {
         foreach (Match m in Regex.Matches(body, @"<EnumType Name=""([^""]+)""[^>]*>(.*?)</EnumType>", RegexOptions.Singleline, TimeSpan.FromSeconds(30)))
         {
@@ -1156,7 +1215,7 @@ public sealed class GraphSchemaMockPlugin(
             var members = Regex.Matches(inner, @"<Member Name=""([^""]+)""")
                 .Select(mm => mm.Groups[1].Value)
                 .ToList();
-            _enumTypes[$"{namespaceName}.{name}"] = members;
+            registry.EnumTypes[$"{namespaceName}.{name}"] = members;
         }
     }
 
@@ -1164,7 +1223,7 @@ public sealed class GraphSchemaMockPlugin(
     // not nested inside it - and their binding parameter's name varies across the real
     // file ("bindingParameter", "bindingparameter", "bindparameter"), so it's identified
     // by being the first <Parameter>, never by name.
-    private void ParseOperationBlocks(string body, string tagName, bool isAction)
+    private static void ParseOperationBlocks(SchemaRegistry registry, string body, string tagName, bool isAction)
     {
         var pattern = $@"<{tagName} Name=""([^""]+)""[^>]*?IsBound=""true""[^>]*?(?:/>|>(.*?)</{tagName}>)";
         foreach (Match m in Regex.Matches(body, pattern, RegexOptions.Singleline, TimeSpan.FromSeconds(30)))
@@ -1180,7 +1239,7 @@ public sealed class GraphSchemaMockPlugin(
 
             var bindingType = bindingMatch.Groups[1].Value;
             var isCollectionBound = IsCollectionType(bindingType);
-            var boundTo = ResolveRefName(StripCollection(bindingType));
+            var boundTo = ResolveRefName(registry, StripCollection(bindingType));
 
             var returnMatch = Regex.Match(inner, @"<ReturnType Type=""([^""]+)""");
             var def = new FunctionActionDef
@@ -1191,7 +1250,7 @@ public sealed class GraphSchemaMockPlugin(
                 ReturnType = returnMatch.Success ? returnMatch.Groups[1].Value : null,
             };
 
-            var table = isAction ? _actionsByBindingType : _functionsByBindingType;
+            var table = isAction ? registry.ActionsByBindingType : registry.FunctionsByBindingType;
             if (!table.TryGetValue(boundTo, out var list))
             {
                 table[boundTo] = list = [];
@@ -1201,7 +1260,7 @@ public sealed class GraphSchemaMockPlugin(
         }
     }
 
-    private List<FunctionActionDef> GetAllBoundOperations(string fullName, bool isCollection, Dictionary<string, List<FunctionActionDef>> table)
+    private static List<FunctionActionDef> GetAllBoundOperations(SchemaRegistry registry, string fullName, bool isCollection, Dictionary<string, List<FunctionActionDef>> table)
     {
         var result = new List<FunctionActionDef>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
@@ -1213,8 +1272,8 @@ public sealed class GraphSchemaMockPlugin(
                 result.AddRange(ops.Where(o => o.IsCollectionBound == isCollection));
             }
 
-            current = _registry.TryGetValue(current, out var def) && !string.IsNullOrEmpty(def.BaseType)
-                ? ResolveRefName(def.BaseType)
+            current = registry.Types.TryGetValue(current, out var def) && !string.IsNullOrEmpty(def.BaseType)
+                ? ResolveRefName(registry, def.BaseType)
                 : null;
         }
 
@@ -1228,34 +1287,35 @@ public sealed class GraphSchemaMockPlugin(
     // first since a name collision between a Function and an Action bound to the
     // same type would be unusual; HandleFunction/HandleAction each still reject
     // the wrong HTTP method regardless of which table produced the match.
-    private FunctionActionDef? TryMatchBoundOperation(ResolvedNode current, string segment)
+    private static FunctionActionDef? TryMatchBoundOperation(SchemaRegistry registry, ResolvedNode current, string segment)
     {
         var parenIdx = segment.IndexOf('(', StringComparison.Ordinal);
         var bareName = parenIdx >= 0 ? segment[..parenIdx] : segment;
 
-        return GetAllBoundOperations(current.TypeFullName, current.IsCollection, _functionsByBindingType)
+        return GetAllBoundOperations(registry, current.TypeFullName, current.IsCollection, registry.FunctionsByBindingType)
                 .FirstOrDefault(o => string.Equals(o.Name, bareName, StringComparison.OrdinalIgnoreCase))
-            ?? GetAllBoundOperations(current.TypeFullName, current.IsCollection, _actionsByBindingType)
+            ?? GetAllBoundOperations(registry, current.TypeFullName, current.IsCollection, registry.ActionsByBindingType)
                 .FirstOrDefault(o => string.Equals(o.Name, bareName, StringComparison.OrdinalIgnoreCase));
     }
 
     // --- inherited-member resolution ---
 
-    private List<(string Name, string Type)> GetAllProperties(string fullName)
+    private static List<(string Name, string Type)> GetAllProperties(SchemaRegistry registry, string fullName)
     {
         var result = new List<(string Name, string Type)>();
-        CollectMembers(fullName, result, [], static def => def.Properties);
+        CollectMembers(registry, fullName, result, [], static def => def.Properties);
         return result;
     }
 
-    private List<(string Name, string Type)> GetAllNavigationProperties(string fullName)
+    private static List<(string Name, string Type)> GetAllNavigationProperties(SchemaRegistry registry, string fullName)
     {
         var result = new List<(string Name, string Type)>();
-        CollectMembers(fullName, result, [], static def => def.NavigationProperties);
+        CollectMembers(registry, fullName, result, [], static def => def.NavigationProperties);
         return result;
     }
 
-    private void CollectMembers(
+    private static void CollectMembers(
+        SchemaRegistry registry,
         string fullName,
         List<(string Name, string Type)> result,
         HashSet<string> seen,
@@ -1266,14 +1326,14 @@ public sealed class GraphSchemaMockPlugin(
             return;
         }
 
-        if (!_registry.TryGetValue(fullName, out var def))
+        if (!registry.Types.TryGetValue(fullName, out var def))
         {
             return;
         }
 
         if (!string.IsNullOrEmpty(def.BaseType))
         {
-            CollectMembers(ResolveRefName(def.BaseType), result, seen, selector);
+            CollectMembers(registry, ResolveRefName(registry, def.BaseType), result, seen, selector);
         }
 
         result.AddRange(selector(def));
