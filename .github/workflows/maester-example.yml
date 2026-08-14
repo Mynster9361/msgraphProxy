@@ -64,20 +64,23 @@ jobs:
                   $results = Invoke-Maester -Path ./maester-tests/Maester/Entra -OutputFolder test-results -OutputFolderFileName "test-results" -PassThru -NonInteractive
 
                   # Full test-results.json/.md can run into several MB across
-                  # 700+ tests - past the step summary's 1MB cap and large
-                  # enough to make artifact upload itself unreliable. Export
-                  # a slim per-test summary instead.
-                  $results.Tests |
-                      Select-Object Id, Title, Result, Severity, Block, Duration, @{ Name = 'Tag'; Expression = { $_.Tag -join ', ' } } |
-                      ConvertTo-Json -Depth 3 |
-                      Set-Content -Path test-results/test-results-slim.json
+                  # 700+ tests - past the step summary's 1MB cap. Scoped to
+                  # Maester/Entra's ~60 tests, a per-test table fits
+                  # comfortably, so it's written straight to the step summary
+                  # instead of relying on artifact upload (unreliable in this
+                  # environment - CreateArtifact reliably fails here).
+                  $summaryTable = $results.Tests |
+                      Sort-Object Result, Id |
+                      ForEach-Object { "| $($_.Id) | $($_.Result) | $($_.Title) |" }
 
                   Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @"
                   # Maester results (against msgraphProxy mock)
 
                   Total: $($results.TotalCount), Passed: $($results.PassedCount), Failed: $($results.FailedCount), Skipped: $($results.SkippedCount)
 
-                  See the maester-test-results artifact for a per-test pass/fail/skip summary.
+                  | Id | Result | Title |
+                  | --- | --- | --- |
+                  $($summaryTable -join "`n")
                   "@
 
                   Write-Host "Total: $($results.TotalCount), Passed: $($results.PassedCount), Failed: $($results.FailedCount), Skipped: $($results.SkippedCount)"
@@ -96,11 +99,3 @@ jobs:
               run: |
                   Import-Module ./msgraphProxy/msgraphProxy.psd1 -Force
                   Stop-MsGraphProxy -Confirm:$false
-
-            - name: Archive Maester test results
-              uses: actions/upload-artifact@v7
-              if: always()
-              continue-on-error: true
-              with:
-                  name: maester-test-results
-                  path: test-results/test-results-slim.json
