@@ -4,17 +4,15 @@
 		Stops the Dev Proxy process started by Start-MsGraphProxy.
 	
 	.DESCRIPTION
-		If Dev Proxy is recording, first stops the recording through its control
-		API. That triggers its reporting plugins (Graph minimal permissions,
-		execution summary) to analyze what was recorded; their results are
-		collected and returned as part of the result object under Recording.
-	
-		Then asks Dev Proxy to shut down gracefully through its control API, so
-		it can unregister itself as the Windows system proxy on its way out.
-		Only if that doesn't succeed within the timeout does it force-kill the
-		process - and in that case it also clears the Windows system-proxy
-		registration itself, since a force-kill skips the cleanup Dev Proxy
-		would otherwise have done.
+		If Dev Proxy is recording, first stops the recording through its
+		control API. That triggers its reporting plugins (Graph minimal
+		permissions, execution summary) to analyze what was recorded; their
+		results are returned as part of the result object, under Recording.
+
+		Then asks Dev Proxy to shut down gracefully through its control API.
+		If it doesn't stop within -TimeoutSeconds, the process is force-killed
+		instead, and any Windows system-proxy registration is cleared
+		manually (a graceful shutdown does this on its own).
 	
 	.PARAMETER TimeoutSeconds
 		How long to wait for a graceful shutdown before falling back to killing
@@ -33,6 +31,9 @@
 		PS C:\> Stop-MsGraphProxy
 	
 		Stops the running Dev Proxy instance and returns any recorded reports.
+
+	.LINK
+		https://mynster-it.dk/docs/modules/msgraphProxy/commands/Stop-MsGraphProxy
 	#>
 	[CmdletBinding(SupportsShouldProcess)]
 	param (

@@ -4,40 +4,37 @@
 		Downloads and installs the self-contained Dev Proxy build this module wraps.
 	
 	.DESCRIPTION
-		Downloads the zipped, self-contained Dev Proxy build from the latest
-		msgraphProxy GitHub release and extracts it into the module's local
-		binary cache, so it can run without a .NET installation on this machine.
+		Downloads the zipped, self-contained Dev Proxy build (bundled with this
+		module's GraphSchemaMockPlugin and EntraTokenMockPlugin extensions)
+		from this repository's latest GitHub release, and extracts it into the
+		module's local binary cache - no separate DOTNET installation needed on
+		this machine.
 
-		Relying on GitHub's /releases/latest here only works because of how
-		the two release pipelines in this repo divide that up: build.yml
-		(the PowerShell-module release, on every push to main) is the one
-		release meant to be "latest", and vsts-release.ps1 bundles that
-		release with the most recent Dev Proxy binaries build alongside the
-		module content - while build-devproxy-binaries.yml (which actually
-		builds Dev Proxy from source together with the GraphSchemaMockPlugin
-		and EntraTokenMockPlugin extensions this module depends on) publishes
-		its own builds as prereleases specifically so they never compete for
-		"latest" themselves. If that ever changes - either pipeline stops
-		coordinating with the other - /releases/latest could return a release
-		with no matching Rid asset, which is what the error below is for.
-	
+		If a build for the target RID is already cached, this does nothing
+		unless -Force is passed. Start-MsGraphProxy calls this automatically
+		the first time it needs to, so you normally don't need to call it
+		yourself.
+
 	.PARAMETER Rid
-		The .NET runtime identifier to install a build for. Defaults to the RID
+		The DOTNET runtime identifier to install a build for. Defaults to the RID
 		matching the current operating system.
-	
+
 	.PARAMETER Force
 		Reinstall even if a build for this RID is already cached.
-	
+
 	.EXAMPLE
 		PS C:\> Install-MsGraphProxy
-	
+
 		Downloads and installs the Dev Proxy build matching the current OS.
-	
+
 	.EXAMPLE
 		PS C:\> Install-MsGraphProxy -Force
-	
+
 		Re-downloads and reinstalls the Dev Proxy build, replacing whatever is
 		already cached.
+
+	.LINK
+		https://mynster-it.dk/docs/modules/msgraphProxy/commands/Install-MsGraphProxy
 	#>
 	[CmdletBinding()]
 	param (

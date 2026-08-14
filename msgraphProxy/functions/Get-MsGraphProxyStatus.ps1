@@ -5,15 +5,25 @@
 		still running.
 	
 	.DESCRIPTION
-		Reads the state file written by Start-MsGraphProxy and checks whether the
-		process it recorded is still alive, returning its tracked configuration
-		file, executable path, control-API port, recording state and start time
-		alongside the current running state.
-	
+		Reads the state file written by Start-MsGraphProxy and checks whether
+		the process it recorded is still alive. Returns an object with:
+			Running    - whether the process is currently alive
+			Id         - its process ID
+			ConfigFile - the devproxyrc.json it was started with
+			ExePath    - path to the Dev Proxy executable
+			ApiPort    - its control-API port
+			Recording  - whether it's currently recording
+			StartedAt  - when it was started
+		If Start-MsGraphProxy was never called (or Stop-MsGraphProxy already
+		cleaned up), all of these are $false/$null.
+
 	.EXAMPLE
 		PS C:\> Get-MsGraphProxyStatus
-	
+
 		Returns an object describing whether Dev Proxy is currently running.
+	
+	.LINK
+		https://mynster-it.dk/docs/modules/msgraphProxy/commands/Get-MsGraphProxyStatus
 	#>
 	[CmdletBinding()]
 	param ()

@@ -69,10 +69,6 @@
 			}
 		}
 		'Free' {
-			# A real tenant on Entra ID Free still has *some* subscribedSkus
-			# entry (Exchange, Teams, whatever else) - just none of them carry
-			# a P1/P2/Governance service plan, which is what actually makes
-			# Get-MtLicenseInformation fall through to 'Free'.
 			[pscustomobject]@{
 				skuPartNumber    = 'EXCHANGESTANDARD'
 				capabilityStatus = 'Enabled'

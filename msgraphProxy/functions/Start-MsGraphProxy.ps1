@@ -5,81 +5,52 @@
 	
 	.DESCRIPTION
 		Launches the cached Dev Proxy executable against a devproxyrc.json
-		configuration, and tracks the resulting process so Stop-MsGraphProxy and
-		Get-MsGraphProxyStatus can find it again later, even from a different
-		PowerShell session. If Dev Proxy hasn't been installed yet for this OS,
-		it's installed automatically first (see Install-MsGraphProxy).
-	
-		Recording starts automatically with the proxy, so Stop-MsGraphProxy can
-		stop it again and return the resulting reports (such as minimal Graph
-		permissions) as an object. Pass -NoRecord to opt out.
+		configuration, and tracks the resulting process so Stop-MsGraphProxy
+		and Get-MsGraphProxyStatus can find it again later, even from a
+		different PowerShell session. If Dev Proxy hasn't been installed yet
+		for this OS, it's installed automatically first (see
+		Install-MsGraphProxy).
 
-		Dev Proxy's own console output is redirected to
-		<temp>\msgraphproxy-devproxy-std{out,err}.log rather than left attached
-		to this session, since Start-Process is fire-and-forget - if Dev Proxy
-		exits or refuses to bind its ports right after starting, those files
-		are the only place to see why.
-	
-		Dev Proxy registers itself as the Windows system HTTP/HTTPS proxy while
-		running, so every proxy-aware application on the machine routes through
-		it - it only decrypts and inspects hosts listed in its "urlsToWatch"
-		configuration, tunnelling everything else through untouched.
-	
+		Recording starts automatically with the proxy, so Stop-MsGraphProxy
+		can stop it again and return the resulting reports (such as minimal
+		Graph permissions) as an object. Pass -NoRecord to opt out.
+
+		While running, Dev Proxy intercepts and mocks calls to the hosts
+		listed in its "urlsToWatch" configuration (Microsoft Graph and the
+		Entra ID token endpoint, by default), tunnelling everything else
+		through untouched.
+
 	.PARAMETER ConfigFile
 		Path to a devproxyrc.json/.yaml configuration file. Defaults to the
 		configuration bundled with this module.
-	
+
 	.PARAMETER ApiPort
 		Port for Dev Proxy's control API, used by Stop-MsGraphProxy for a
 		graceful shutdown. Defaults to Dev Proxy's own default port, 8897.
-	
+
 	.PARAMETER NoRecord
 		Don't start recording automatically. Without this switch, Dev Proxy
 		starts recording immediately so Stop-MsGraphProxy has something to stop
 		and report on.
-	
+
 	.PARAMETER Force
 		Start a new instance even if one is already tracked as running.
 
 	.PARAMETER CI
-		Configure Dev Proxy for a non-interactive session (CI pipelines, Pester
-		runs, etc.) instead of normal interactive use. On Windows, certificate
-		auto-install is disabled in the launched config - with it left on, Dev
-		Proxy awaits an interactive OS confirmation dialog to trust its root CA
-		before it even starts listening, which never resolves non-interactively
-		and leaves the proxy port refusing every connection. That's a
-		Windows-only risk (Dev Proxy only attempts OS trust automatically on
-		Windows to begin with), so Linux and macOS keep certificate
-		auto-install on - which also means they get Dev Proxy's normal,
-		correct per-domain certificate generation, unlike Windows: disabling
-		auto-install has a real side effect beyond skipping OS trust, covered
-		in Install-MsGraphProxyCertificate's help, that this module's build
-		pipeline patches around for Windows specifically.
-
-		Instead of relying on Dev Proxy's system-wide proxy registration -
-		Windows-only, and wasn't reliably picked up by other processes in
-		testing anyway - this sets HTTP_PROXY/HTTPS_PROXY (and lowercase) for
-		the current process, for non-.NET child processes started later in
-		this session, and directly overrides
-		[System.Net.Http.HttpClient]::DefaultProxy, since that's lazily
-		evaluated from the environment once and then cached - setting the
-		environment variables alone doesn't reliably reach PowerShell/.NET
-		code running in *this* process. The root certificate is then trusted
-		automatically via Install-MsGraphProxyCertificate on a best-effort
-		basis - see its help for what "best-effort" means here, particularly
-		on Windows. The returned object gains a CertificateTrusted property
-		reflecting whether that succeeded; confirmed end-to-end (including
-		through the Microsoft Graph PowerShell SDK's own HTTP client, not
-		just Invoke-RestMethod) that once it's true, HTTPS calls validate
-		cleanly with no client-side accommodation needed.
+		Configure Dev Proxy for a non-interactive session (CI pipelines,
+		Pester runs, etc.) instead of normal interactive use: sets
+		HTTP_PROXY/HTTPS_PROXY for the current session so Graph calls route
+		through the proxy, and trusts Dev Proxy's root certificate
+		automatically on a best-effort basis (see the returned object's
+		CertificateTrusted property, and Install-MsGraphProxyCertificate's
+		help for what "best-effort" means).
 
 	.PARAMETER EntraIDLicense
 		Which Entra ID license tier the mocked tenant's subscribedSkus should
 		report - Free, P1, P2 or Governance. Defaults to P2, so license-gated
 		checks (e.g. Maester's Get-MtLicenseInformation) see a licensed tenant
 		out of the box. Pass -EntraIDLicense explicitly to pick a different
-		tier; the config file's own bundled default is used only when this
-		parameter isn't passed at all.
+		tier.
 
 	.PARAMETER WhatIf
 		If this switch is enabled, no actions are performed but informational
@@ -106,6 +77,9 @@
 		Starts Dev Proxy configured for a CI pipeline: no certificate prompt to
 		block startup, HTTP_PROXY/HTTPS_PROXY set for the current process, and
 		its root certificate trusted automatically where possible.
+
+	.LINK
+		https://mynster-it.dk/docs/modules/msgraphProxy/commands/Start-MsGraphProxy
 	#>
 	[CmdletBinding(SupportsShouldProcess)]
 	param (
@@ -159,20 +133,11 @@
 		$proxyPort = $derivedConfig.ProxyPort
 	}
 
-	# Start-Process doesn't quote array elements containing spaces itself, so
-	# a config path with a space in it would otherwise be split into two
-	# arguments on the receiving end.
 	$processArgs = @('--config-file', "`"$resolvedConfigFile`"", '--api-port', $ApiPort)
 	if (-not $NoRecord) {
 		$processArgs += '--record'
 	}
 
-	# Redirected rather than left to inherit the console: Start-Process is
-	# fire-and-forget, so without this, a Dev Proxy process that crashes or
-	# refuses to bind its ports on startup leaves nothing behind to diagnose
-	# why - confirmed directly the hard way, when a CI run's control API and
-	# proxy port both refused every connection with no clue as to which of
-	# Dev Proxy's own startup steps never completed.
 	if (Test-Path -Path $script:MsGraphProxyStdOutLog) { Remove-Item -Path $script:MsGraphProxyStdOutLog -Force }
 	if (Test-Path -Path $script:MsGraphProxyStdErrLog) { Remove-Item -Path $script:MsGraphProxyStdErrLog -Force }
 
@@ -204,28 +169,12 @@
 			[System.Environment]::SetEnvironmentVariable($name, $proxyUri, 'Process')
 		}
 
-		# 'Process'-scoped env vars die with this process, which is fine for a
-		# normal interactive session but not in GitHub Actions: each workflow
-		# step runs in its own fresh pwsh process, so a later step (e.g. one
-		# calling Invoke-RestMethod against the mock) wouldn't see them at
-		# all and would fall through to the real endpoint instead of this
-		# proxy. Appending to $GITHUB_ENV, when present, carries them forward
-		# into every subsequent step's environment.
 		if ($env:GITHUB_ENV) {
 			foreach ($name in 'HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy') {
 				Add-Content -Path $env:GITHUB_ENV -Value "$name=$proxyUri"
 			}
 		}
 
-		# The env vars above cover non-.NET child processes spawned later in
-		# this session (curl, Node, Python, etc. - each reads them fresh at
-		# its own startup). They're not enough on their own for .NET/PowerShell
-		# code running in *this* process, though: HttpClient.DefaultProxy is
-		# lazily evaluated from the environment once and then cached for the
-		# rest of the process - confirmed directly, setting the env vars alone
-		# still let a plain Invoke-RestMethod reach the real graph.microsoft.com
-		# instead of this proxy. Overriding DefaultProxy directly takes effect
-		# immediately regardless of that caching.
 		[System.Net.Http.HttpClient]::DefaultProxy = [System.Net.WebProxy]::new($proxyUri)
 
 		$certificateTrusted = $false
