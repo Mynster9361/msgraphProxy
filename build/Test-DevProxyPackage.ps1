@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Smoke-tests a packaged Dev Proxy build by actually running it and driving
     real Microsoft Graph requests through it.

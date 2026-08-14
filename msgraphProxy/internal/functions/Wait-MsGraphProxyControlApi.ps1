@@ -1,4 +1,4 @@
-function Wait-MsGraphProxyControlApi {
+﻿function Wait-MsGraphProxyControlApi {
 	<#
 	.SYNOPSIS
 		Waits for Dev Proxy's control API to start responding.

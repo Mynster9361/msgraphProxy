@@ -1,7 +1,7 @@
 ﻿Import-Module .\msgraphProxy\msgraphProxy.psd1 -Verbose -Force
 # start-msgraphproxy will try and install a certificate to the certificate store on windows if it needs to be able to record then it needs to be trusted it is shipped with dev-proxy
 start-MsGraphProxy
-# Once it is started you are able to launch requests against the api like authentication 
+# Once it is started you are able to launch requests against the api like authentication
 
 $tenantId = "123"
 $clientId = "123"
@@ -24,8 +24,8 @@ $headers = @{
 Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/users' -Headers $headers
 
 # Also does not have to be an actual token so you can skip auth like so:
-$headers = @{ 
-	Authorization = 'Bearer faketoken' 
+$headers = @{
+	Authorization = 'Bearer faketoken'
 }
 Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/users' -Headers $headers
 

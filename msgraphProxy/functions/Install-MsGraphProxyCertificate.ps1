@@ -1,4 +1,4 @@
-function Install-MsGraphProxyCertificate {
+﻿function Install-MsGraphProxyCertificate {
 	<#
 	.SYNOPSIS
 		Trusts the running Dev Proxy instance's root CA certificate for the
@@ -113,7 +113,7 @@ function Install-MsGraphProxyCertificate {
 			$isRoot = (& id -u) -eq '0'
 			$dest = '/usr/local/share/ca-certificates/msgraphproxy-devproxy.crt'
 			if ($isRoot) {
-				cp $certPath $dest
+				Copy-Item -Path $certPath -Destination $dest
 				update-ca-certificates | Out-Null
 			} else {
 				sudo cp $certPath $dest
