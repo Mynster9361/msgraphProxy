@@ -5,6 +5,8 @@
 >The root of this module "EntraTokenMockPlugin.cs", "GraphSchemaMockPlugin.cs" & "build-devproxy-binaries.yml" has been heavely inflused and build by AI but otherwise guided and tested by me
 >
 >The rest of the powershell code is dual operation so a bit of AI a bit of me and will be cleaned up before official launch of the module
+>
+>All required research and intel gathering for the core of the module in order to even build this module is done by my self
 
 > This module is not yet released to PSGallery and is a work in progress
 > The code that is currently in the repo might not work
