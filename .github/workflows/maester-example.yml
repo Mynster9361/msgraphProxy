@@ -1,20 +1,7 @@
-﻿# Demonstrates running Maester (https://maester.dev), a real, widely-used
-# Entra/M365 security-testing framework, against msgraphProxy's mock instead
-# of a real tenant - the flagship example of what this module is actually
-# for: letting a module/test author exercise real Graph-calling PowerShell
-# tooling in CI without a real app registration or tenant.
-#
-# IMPORTANT: results here reflect msgraphProxy's schema-accurate but entirely
-# FABRICATED data, not any real security posture. Confirmed by actually
-# running this: some Maester checks pass, some are sensibly skipped (e.g.
-# checks requiring an Entra ID P1/P2 license, since the mock doesn't model
-# licensing), some fail because fabricated cross-references naturally don't
-# line up (e.g. a policy "referencing" a group id that isn't the same
-# fabricated group another call returned), and a couple of checks bound to
-# very specific real-API response shapes (What-If evaluation results, in
-# particular) don't run cleanly against generic fabricated data. None of
-# that is a real security finding - this workflow deliberately does not
-# fail the build on Maester's own pass/fail results, only on the
+# Demonstrates running Maester (https://maester.dev) against msgraphProxy's
+# mock instead of a real tenant. Results reflect schema-accurate but entirely
+# FABRICATED data, not any real security posture, so this workflow doesn't
+# fail the build on Maester's own pass/fail results - only on the
 # proxy/connection/query plumbing itself failing outright.
 name: Maester example (against msgraphProxy mock)
 
@@ -41,11 +28,8 @@ jobs:
             - name: Start msgraphProxy in CI mode
               shell: pwsh
               run: |
-                  # Uses this repo's own module source directly, since this
-                  # workflow is exercising msgraphProxy's current code. A
-                  # real consumer in their own repo would instead run:
+                  # A real consumer would instead run:
                   #   Install-Module msgraphProxy -Scope CurrentUser -Force
-                  #   Import-Module msgraphProxy
                   Import-Module ./msgraphProxy/msgraphProxy.psd1 -Force
                   Install-MsGraphProxy
                   $result = Start-MsGraphProxy -CI -Confirm:$false
@@ -57,15 +41,8 @@ jobs:
                   Import-Module ./msgraphProxy/msgraphProxy.psd1 -Force
                   Import-Module Microsoft.Graph.Authentication -Force
 
-                  # There's no real app registration to authenticate against -
-                  # EntraTokenMockPlugin issues a self-signed, well-formed JWT
-                  # for any client_id/secret, which is enough for the
-                  # Microsoft Graph PowerShell SDK to accept via -AccessToken.
-                  # (Connect-MgGraph -ClientSecretCredential also reaches the
-                  # mocked token endpoint successfully, but its underlying
-                  # MSAL token cache handling is unrelated to msgraphProxy and
-                  # wasn't reliable in testing - -AccessToken sidesteps that
-                  # entirely and is what's proven to work end-to-end.)
+                  # EntraTokenMockPlugin issues a well-formed JWT for any
+                  # client_id/secret - no real app registration needed.
                   $tokenBody = @{
                       client_id     = 'test'
                       grant_type    = 'client_credentials'
@@ -78,38 +55,23 @@ jobs:
 
                   Install-Module Maester -Scope CurrentUser -Force
                   Import-Module Maester -Force
-                  # A separate, dedicated folder from this repo's own ./tests
-                  # (which already holds this module's Pester suite) -
-                  # Install-MaesterTests prompts interactively to confirm
-                  # installing into a non-empty folder, which would otherwise
-                  # hang/fail non-interactively in CI.
+                  # Separate from this repo's own ./tests (Pester suite) -
+                  # Install-MaesterTests prompts if the target isn't empty.
                   Install-MaesterTests -Path ./maester-tests
 
-                  $results = Invoke-Maester -Path ./maester-tests -OutputFolder test-results -OutputFolderFileName "test-results" -PassThru -NonInteractive
+                  # Scoped to Maester/Entra: the subset that actually calls
+                  # Microsoft Graph, unlike Exchange/Teams/Purview/Intune etc.
+                  $results = Invoke-Maester -Path ./maester-tests/Maester/Entra -OutputFolder test-results -OutputFolderFileName "test-results" -PassThru -NonInteractive
 
-                  # The full test-results.json/.md carry every test's full
-                  # TestDescription/TestResult markdown (megabytes' worth
-                  # across 700+ tests) - well past the step summary's 1MB cap
-                  # (confirmed directly - a full-report write there aborts
-                  # the step with a runner error even though Maester itself
-                  # succeeded), and large enough on their own to have made
-                  # the artifact upload itself fail outright (ECONNRESET).
-                  # Since this workflow only cares about pass/fail per check
-                  # against the mock, not the full remediation writeups, a
-                  # slim per-test summary is exported here instead and is
-                  # what actually gets uploaded as an artifact.
+                  # Full test-results.json/.md can run into several MB across
+                  # 700+ tests - past the step summary's 1MB cap and large
+                  # enough to make artifact upload itself unreliable. Export
+                  # a slim per-test summary instead.
                   $results.Tests |
                       Select-Object Id, Title, Result, Severity, Block, Duration, @{ Name = 'Tag'; Expression = { $_.Tag -join ', ' } } |
                       ConvertTo-Json -Depth 3 |
                       Set-Content -Path test-results/test-results-slim.json
 
-                  # The full test-results.md can run into several MB, well
-                  # past the step summary's 1MB cap (confirmed directly - a
-                  # full-report write there aborts the step with a runner
-                  # error, even though Maester itself succeeded) - so only a
-                  # short recap goes to the step summary, and the slim
-                  # per-test summary above is left for the "Archive Maester
-                  # test results" step to upload as an artifact instead.
                   Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @"
                   # Maester results (against msgraphProxy mock)
 
@@ -119,9 +81,14 @@ jobs:
                   "@
 
                   Write-Host "Total: $($results.TotalCount), Passed: $($results.PassedCount), Failed: $($results.FailedCount), Skipped: $($results.SkippedCount)"
-                  # Deliberately not failing the build on $results.Result here -
-                  # see the note at the top of this file for why that
-                  # wouldn't mean what it means against a real tenant.
+
+                  # Some Maester checks (DNS/SPF/DMARC) shell out to native
+                  # tools that fail against the mock's fake domains, leaving
+                  # $LASTEXITCODE non-zero with nothing after to reset it -
+                  # which would otherwise fail this step despite no actual
+                  # PowerShell error, and despite this workflow deliberately
+                  # not gating on Maester's pass/fail results (see file header).
+                  $global:LASTEXITCODE = 0
 
             - name: Stop msgraphProxy
               if: always()
