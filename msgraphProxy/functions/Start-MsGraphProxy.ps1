@@ -191,6 +191,19 @@
 			[System.Environment]::SetEnvironmentVariable($name, $proxyUri, 'Process')
 		}
 
+		# 'Process'-scoped env vars die with this process, which is fine for a
+		# normal interactive session but not in GitHub Actions: each workflow
+		# step runs in its own fresh pwsh process, so a later step (e.g. one
+		# calling Invoke-RestMethod against the mock) wouldn't see them at
+		# all and would fall through to the real endpoint instead of this
+		# proxy. Appending to $GITHUB_ENV, when present, carries them forward
+		# into every subsequent step's environment.
+		if ($env:GITHUB_ENV) {
+			foreach ($name in 'HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy') {
+				Add-Content -Path $env:GITHUB_ENV -Value "$name=$proxyUri"
+			}
+		}
+
 		# The env vars above cover non-.NET child processes spawned later in
 		# this session (curl, Node, Python, etc. - each reads them fresh at
 		# its own startup). They're not enough on their own for .NET/PowerShell
