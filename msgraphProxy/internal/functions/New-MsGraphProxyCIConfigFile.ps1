@@ -1,4 +1,4 @@
-function New-MsGraphProxyCIConfigFile {
+﻿function New-MsGraphProxyCIConfigFile {
 	<#
 	.SYNOPSIS
 		Derives a modified copy of a devproxyrc.json - certificate auto-install
@@ -64,7 +64,7 @@ function New-MsGraphProxyCIConfigFile {
 		Returns an object with the generated config's path and the proxy port
 		it declares (or Dev Proxy's default of 8000 if unset).
 	#>
-	[CmdletBinding()]
+	[CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Low')]
 	param (
 		[Parameter(Mandatory)]
 		[string]
@@ -95,7 +95,9 @@ function New-MsGraphProxyCIConfigFile {
 	# dot-prefixed filename (confirmed directly - it reports the file as not
 	# found even though it exists at the exact path passed via --config-file).
 	$ciConfigFile = Join-Path -Path (Split-Path -Path $ConfigFile -Parent) -ChildPath 'msgraphproxy-ci-devproxyrc.json'
-	$config | ConvertTo-Json -Depth 10 | Set-Content -Path $ciConfigFile
+	if ($PSCmdlet.ShouldProcess($ciConfigFile, 'Write derived Dev Proxy config')) {
+		$config | ConvertTo-Json -Depth 10 | Set-Content -Path $ciConfigFile
+	}
 
 	[pscustomobject]@{
 		ConfigFile = $ciConfigFile

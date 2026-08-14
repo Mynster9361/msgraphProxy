@@ -1,4 +1,4 @@
-function Get-MsGraphProxyEntraIDLicensePreset {
+﻿function Get-MsGraphProxyEntraIDLicensePreset {
 	<#
 	.SYNOPSIS
 		Builds a graphSchemaMockPlugin subscribedSkus entry for a named Entra ID
