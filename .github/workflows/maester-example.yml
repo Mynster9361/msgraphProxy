@@ -78,9 +78,14 @@ jobs:
 
                   Install-Module Maester -Scope CurrentUser -Force
                   Import-Module Maester -Force
-                  Install-MaesterTests -Path ./tests
+                  # A separate, dedicated folder from this repo's own ./tests
+                  # (which already holds this module's Pester suite) -
+                  # Install-MaesterTests prompts interactively to confirm
+                  # installing into a non-empty folder, which would otherwise
+                  # hang/fail non-interactively in CI.
+                  Install-MaesterTests -Path ./maester-tests
 
-                  $results = Invoke-Maester -OutputFolder test-results -OutputFolderFileName "test-results" -PassThru -NonInteractive
+                  $results = Invoke-Maester -Path ./maester-tests -OutputFolder test-results -OutputFolderFileName "test-results" -PassThru -NonInteractive
 
                   $summary = Get-Content test-results/test-results.md
                   Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary
