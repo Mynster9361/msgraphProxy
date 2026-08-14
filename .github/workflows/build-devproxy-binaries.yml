@@ -104,5 +104,13 @@ jobs:
               env:
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
               run: |
+                  # --prerelease: build.yml's module release (vsts-release.ps1) is
+                  # the one meant to be GitHub's "latest" release - it bundles
+                  # these same binaries in with the published module version.
+                  # Without --prerelease, this release would claim "latest" for
+                  # itself the moment it's published, which carries no module
+                  # content, and get bumped out of it again by the next module
+                  # release anyway - neither of which Install-MsGraphProxy (which
+                  # reads /releases/latest) should ever have to see.
                   $tag = "devproxy-$(Get-Date -Format yyyyMMdd-HHmmss)"
-                  gh release create $tag .\package\*.zip --title $tag --notes "Automated Dev Proxy build with the msgraphProxy plugins (GraphSchemaMockPlugin, EntraTokenMockPlugin)."
+                  gh release create $tag .\package\*.zip --title $tag --notes "Automated Dev Proxy build with the msgraphProxy plugins (GraphSchemaMockPlugin, EntraTokenMockPlugin)." --prerelease

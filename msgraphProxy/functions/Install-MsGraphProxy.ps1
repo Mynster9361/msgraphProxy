@@ -7,9 +7,19 @@
 		Downloads the zipped, self-contained Dev Proxy build from the latest
 		msgraphProxy GitHub release and extracts it into the module's local
 		binary cache, so it can run without a .NET installation on this machine.
-		That release is produced by this repository's own build pipeline, which
-		builds Dev Proxy from source together with the GraphSchemaMockPlugin and
-		EntraTokenMockPlugin extensions this module depends on.
+
+		Relying on GitHub's /releases/latest here only works because of how
+		the two release pipelines in this repo divide that up: build.yml
+		(the PowerShell-module release, on every push to main) is the one
+		release meant to be "latest", and vsts-release.ps1 bundles that
+		release with the most recent Dev Proxy binaries build alongside the
+		module content - while build-devproxy-binaries.yml (which actually
+		builds Dev Proxy from source together with the GraphSchemaMockPlugin
+		and EntraTokenMockPlugin extensions this module depends on) publishes
+		its own builds as prereleases specifically so they never compete for
+		"latest" themselves. If that ever changes - either pipeline stops
+		coordinating with the other - /releases/latest could return a release
+		with no matching Rid asset, which is what the error below is for.
 	
 	.PARAMETER Rid
 		The .NET runtime identifier to install a build for. Defaults to the RID
