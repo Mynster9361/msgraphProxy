@@ -260,7 +260,7 @@ public sealed class GraphSchemaMockPlugin(
                 array.Add(trimmed);
             }
 
-            return (new JsonObject { ["value"] = array }, HttpStatusCode.OK);
+            return (new JsonObject { ["@odata.context"] = BuildODataContext(request), ["value"] = array }, HttpStatusCode.OK);
         }
 
         if (method == "POST")
@@ -278,10 +278,39 @@ public sealed class GraphSchemaMockPlugin(
             }
 
             pool.Add(created);
-            return (created.DeepClone(), HttpStatusCode.Created);
+            var createdBody = created.DeepClone().AsObject();
+            createdBody["@odata.context"] = BuildODataContext(request) + "/$entity";
+            return (createdBody, HttpStatusCode.Created);
         }
 
         return (null, null);
+    }
+
+    // Real Graph responses always carry "@odata.context" - collections at the
+    // top level, single entities suffixed with "/$entity" - and callers do
+    // rely on it: Maester's own Invoke-MtGraphRequest, for one, only stamps
+    // "@odata.context" onto individual collection items when it's missing
+    // from the *container* response (a latent bug there - it means to check
+    // each item, not the container - that real Graph responses never trip
+    // since they always carry it at the container level). Leaving it out
+    // here made that dormant bug fire: a cached response's items would get
+    // "@odata.context" added once, then a second read of that same cached
+    // object would try to add it again and fail with "member already
+    // exists". Matching real Graph's shape avoids that and is simply more
+    // schema-accurate besides.
+    private static string BuildODataContext(Request request)
+    {
+        var path = request.RequestUri.AbsolutePath;
+        var versionIndex = path.IndexOf(VersionSegment, StringComparison.OrdinalIgnoreCase);
+        var remainder = versionIndex >= 0 ? path[(versionIndex + VersionSegment.Length)..].Trim('/') : "";
+        var firstSegment = remainder.Split('/', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
+        var parenIndex = firstSegment.IndexOf('(', StringComparison.Ordinal);
+        if (parenIndex >= 0)
+        {
+            firstSegment = firstSegment[..parenIndex];
+        }
+
+        return $"{request.RequestUri.Scheme}://{request.RequestUri.Host}{VersionSegment}$metadata#{firstSegment}";
     }
 
     private (JsonNode? Body, HttpStatusCode? StatusCode) HandleItem(string typeFullName, string itemId, string method, Request request)
@@ -300,6 +329,7 @@ public sealed class GraphSchemaMockPlugin(
                 {
                     var trimmed = TrimTo(existing, GetSelectedProps(typeFullName, request));
                     ApplyExpand(trimmed, typeFullName, request);
+                    trimmed["@odata.context"] = BuildODataContext(request) + "/$entity";
                     return (trimmed, HttpStatusCode.OK);
                 }
             case "DELETE":
@@ -342,6 +372,7 @@ public sealed class GraphSchemaMockPlugin(
 
         var trimmedRecord = TrimTo(record, GetSelectedProps(typeFullName, request));
         ApplyExpand(trimmedRecord, typeFullName, request);
+        trimmedRecord["@odata.context"] = BuildODataContext(request) + "/$entity";
         return (trimmedRecord, HttpStatusCode.OK);
     }
 
