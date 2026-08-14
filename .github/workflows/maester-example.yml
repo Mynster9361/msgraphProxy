@@ -72,7 +72,7 @@ jobs:
                       client_secret = 'test'
                       scope         = 'https://graph.microsoft.com/.default'
                   }
-                  $tokenResponse = Invoke-RestMethod -Method POST -Uri 'https://login.microsoftonline.com/00000000-0000-0000-0000-0000000000000/oauth2/token' -Body $tokenBody -TimeoutSec 15
+                  $tokenResponse = Invoke-RestMethod -Method POST -Uri 'https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/oauth2/token' -Body $tokenBody -TimeoutSec 15
                   $secureToken = ConvertTo-SecureString $tokenResponse.access_token -AsPlainText -Force
                   Connect-MgGraph -AccessToken $secureToken -NoWelcome
 
