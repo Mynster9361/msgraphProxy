@@ -87,19 +87,35 @@ jobs:
 
                   $results = Invoke-Maester -Path ./maester-tests -OutputFolder test-results -OutputFolderFileName "test-results" -PassThru -NonInteractive
 
+                  # The full test-results.json/.md carry every test's full
+                  # TestDescription/TestResult markdown (megabytes' worth
+                  # across 700+ tests) - well past the step summary's 1MB cap
+                  # (confirmed directly - a full-report write there aborts
+                  # the step with a runner error even though Maester itself
+                  # succeeded), and large enough on their own to have made
+                  # the artifact upload itself fail outright (ECONNRESET).
+                  # Since this workflow only cares about pass/fail per check
+                  # against the mock, not the full remediation writeups, a
+                  # slim per-test summary is exported here instead and is
+                  # what actually gets uploaded as an artifact.
+                  $results.Tests |
+                      Select-Object Id, Title, Result, Severity, Block, Duration, @{ Name = 'Tag'; Expression = { $_.Tag -join ', ' } } |
+                      ConvertTo-Json -Depth 3 |
+                      Set-Content -Path test-results/test-results-slim.json
+
                   # The full test-results.md can run into several MB, well
                   # past the step summary's 1MB cap (confirmed directly - a
                   # full-report write there aborts the step with a runner
                   # error, even though Maester itself succeeded) - so only a
-                  # short recap goes to the step summary, and the full
-                  # .json/.md reports are left for the "Archive Maester test
-                  # results" step to upload as artifacts instead.
+                  # short recap goes to the step summary, and the slim
+                  # per-test summary above is left for the "Archive Maester
+                  # test results" step to upload as an artifact instead.
                   Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @"
                   # Maester results (against msgraphProxy mock)
 
                   Total: $($results.TotalCount), Passed: $($results.PassedCount), Failed: $($results.FailedCount), Skipped: $($results.SkippedCount)
 
-                  See the maester-test-results artifact for the full JSON/Markdown report.
+                  See the maester-test-results artifact for a per-test pass/fail/skip summary.
                   "@
 
                   Write-Host "Total: $($results.TotalCount), Passed: $($results.PassedCount), Failed: $($results.FailedCount), Skipped: $($results.SkippedCount)"
@@ -119,6 +135,4 @@ jobs:
               if: always()
               with:
                   name: maester-test-results
-                  path: |
-                      test-results/*.json
-                      test-results/*.md
+                  path: test-results/test-results-slim.json
