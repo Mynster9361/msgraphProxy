@@ -31,7 +31,7 @@
 	}
 
 	$state = Get-Content -Path $script:MsGraphProxyStateFile -Raw | ConvertFrom-Json
-	$process = Get-Process -Id $state.Id -ErrorAction SilentlyContinue
+	$process = if ($state.Id) { Get-Process -Id $state.Id -ErrorAction SilentlyContinue }
 
 	[pscustomobject]@{
 		Running    = [bool]$process

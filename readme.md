@@ -1,5 +1,9 @@
 # msgraphProxy
 
+> This module is not yet released to PSGallery and is a work in progress
+> The code that is currently in the repo might not work
+> Code for Linux and Mac is only being tested in CICD so experience might vary
+
 A PowerShell wrapper around a self-contained [Dev Proxy](https://github.com/dotnet/dev-proxy) build, extended with
 two custom plugins - `GraphSchemaMockPlugin` (mocks any Microsoft Graph v1.0 endpoint from its CSDL schema, no
 hand-written fixtures needed) and `EntraTokenMockPlugin` (mocks the Entra ID token endpoint so auth flows work
