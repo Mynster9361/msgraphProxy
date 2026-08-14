@@ -87,8 +87,20 @@ jobs:
 
                   $results = Invoke-Maester -Path ./maester-tests -OutputFolder test-results -OutputFolderFileName "test-results" -PassThru -NonInteractive
 
-                  $summary = Get-Content test-results/test-results.md
-                  Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary
+                  # The full test-results.md can run into several MB, well
+                  # past the step summary's 1MB cap (confirmed directly - a
+                  # full-report write there aborts the step with a runner
+                  # error, even though Maester itself succeeded) - so only a
+                  # short recap goes to the step summary, and the full
+                  # .json/.md reports are left for the "Archive Maester test
+                  # results" step to upload as artifacts instead.
+                  Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @"
+                  # Maester results (against msgraphProxy mock)
+
+                  Total: $($results.TotalCount), Passed: $($results.PassedCount), Failed: $($results.FailedCount), Skipped: $($results.SkippedCount)
+
+                  See the maester-test-results artifact for the full JSON/Markdown report.
+                  "@
 
                   Write-Host "Total: $($results.TotalCount), Passed: $($results.PassedCount), Failed: $($results.FailedCount), Skipped: $($results.SkippedCount)"
                   # Deliberately not failing the build on $results.Result here -
@@ -107,4 +119,6 @@ jobs:
               if: always()
               with:
                   name: maester-test-results
-                  path: test-results
+                  path: |
+                      test-results/*.json
+                      test-results/*.md
