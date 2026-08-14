@@ -17,6 +17,28 @@ using Titanium.Web.Proxy.Models;
 
 namespace DevProxy.Plugins.Mocking;
 
+public sealed class GraphSchemaMockServicePlanConfiguration
+{
+    public string ServicePlanId { get; set; } = "";
+    public string? ServicePlanName { get; set; }
+    public string? ProvisioningStatus { get; set; } = "Success";
+}
+
+// Callers rarely care about a subscribedSku's full real shape (accountId,
+// subscriptionIds, etc. - all still generically fabricated) - only that
+// capabilityStatus and servicePlans carry values license-detection logic
+// (e.g. Maester's Get-MtLicenseInformation) actually keys off of, which the
+// generic fabricator can't produce since it doesn't know what a real
+// "Enabled" status or a real Entra ID P2 service plan GUID look like.
+public sealed class GraphSchemaMockSubscribedSkuConfiguration
+{
+    public string SkuPartNumber { get; set; } = "";
+    public string CapabilityStatus { get; set; } = "Enabled";
+    public int PrepaidUnitsEnabled { get; set; } = 10;
+    public int ConsumedUnits { get; set; } = 1;
+    public IEnumerable<GraphSchemaMockServicePlanConfiguration> ServicePlans { get; set; } = [];
+}
+
 public sealed class GraphSchemaMockPluginConfiguration
 {
     public string SchemaFilePath { get; set; } = "graph-schema/v1.0.csdl";
@@ -24,6 +46,9 @@ public sealed class GraphSchemaMockPluginConfiguration
     // left unmocked (falling through to whatever the next plugin/upstream does),
     // same as this plugin's behavior before beta support existed.
     public string? BetaSchemaFilePath { get; set; } = "graph-schema/beta.csdl";
+    // Seeds the subscribedSkus pool from these instead of generic fabrication,
+    // when non-empty - see GraphSchemaMockSubscribedSkuConfiguration.
+    public IEnumerable<GraphSchemaMockSubscribedSkuConfiguration> SubscribedSkus { get; set; } = [];
 }
 
 /// <summary>
@@ -113,6 +138,12 @@ public sealed class GraphSchemaMockPlugin(
     [
         "id", "businessPhones", "displayName", "givenName", "jobTitle", "mail",
         "mobilePhone", "officeLocation", "preferredLanguage", "surname", "userPrincipalName",
+    ];
+
+    private static readonly string[] SubscribedSkuDefaultProperties =
+    [
+        "id", "accountId", "accountName", "appliesTo", "capabilityStatus",
+        "consumedUnits", "prepaidUnits", "servicePlans", "skuId", "skuPartNumber", "subscriptionIds",
     ];
 
     private static readonly Dictionary<string, Func<string>> NameFakes = new(StringComparer.Ordinal)
@@ -551,10 +582,66 @@ public sealed class GraphSchemaMockPlugin(
             return pool;
         }
 
-        var first = BuildEntity(registry, typeFullName);
-        var seeded = new List<JsonObject> { first, SecondSample(first, typeFullName) };
+        var seeded = string.Equals(typeFullName, "microsoft.graph.subscribedSku", StringComparison.Ordinal) && Configuration.SubscribedSkus.Any()
+            ? SeedSubscribedSkuPool(registry, Configuration.SubscribedSkus)
+            : SeedGenericPool(registry, typeFullName);
+
         _store[typeFullName] = seeded;
         return seeded;
+    }
+
+    private static List<JsonObject> SeedGenericPool(SchemaRegistry registry, string typeFullName)
+    {
+        var first = BuildEntity(registry, typeFullName);
+        return [first, SecondSample(first, typeFullName)];
+    }
+
+    // Real Graph shares one accountId/accountName across every subscribedSku
+    // in a tenant, and derives each sku's own "id" as "{accountId}_{skuId}"
+    // rather than a bare guid - both confirmed against a real tenant's
+    // subscribedSkus response.
+    private static List<JsonObject> SeedSubscribedSkuPool(SchemaRegistry registry, IEnumerable<GraphSchemaMockSubscribedSkuConfiguration> skus)
+    {
+        var accountId = Guid.NewGuid().ToString();
+        const string accountName = "contoso";
+        return [.. skus.Select(sku => BuildSubscribedSku(registry, sku, accountId, accountName))];
+    }
+
+    private static JsonObject BuildSubscribedSku(SchemaRegistry registry, GraphSchemaMockSubscribedSkuConfiguration sku, string accountId, string accountName)
+    {
+        var entity = BuildEntity(registry, "microsoft.graph.subscribedSku");
+        var skuId = Guid.NewGuid().ToString();
+        entity["id"] = $"{accountId}_{skuId}";
+        entity["accountId"] = accountId;
+        entity["accountName"] = accountName;
+        entity["appliesTo"] = "User";
+        entity["skuId"] = skuId;
+        entity["skuPartNumber"] = sku.SkuPartNumber;
+        entity["capabilityStatus"] = sku.CapabilityStatus;
+        entity["consumedUnits"] = sku.ConsumedUnits;
+        entity["prepaidUnits"] = new JsonObject
+        {
+            ["enabled"] = sku.PrepaidUnitsEnabled,
+            ["suspended"] = 0,
+            ["warning"] = 0,
+            ["lockedOut"] = 0,
+        };
+        entity["subscriptionIds"] = new JsonArray(Guid.NewGuid().ToString());
+
+        var servicePlans = new JsonArray();
+        foreach (var plan in sku.ServicePlans)
+        {
+            servicePlans.Add(new JsonObject
+            {
+                ["servicePlanId"] = plan.ServicePlanId,
+                ["servicePlanName"] = plan.ServicePlanName ?? plan.ServicePlanId,
+                ["provisioningStatus"] = plan.ProvisioningStatus ?? "Success",
+                ["appliesTo"] = "User",
+            });
+        }
+
+        entity["servicePlans"] = servicePlans;
+        return entity;
     }
 
     private static JsonObject? FindById(List<JsonObject> pool, string id)
@@ -836,6 +923,15 @@ public sealed class GraphSchemaMockPlugin(
         if (string.Equals(fullName, "microsoft.graph.user", StringComparison.Ordinal))
         {
             return [.. UserDefaultProperties];
+        }
+
+        // servicePlans is a Collection(complexType), so the generic
+        // scalar-only trimming below would otherwise drop it by default -
+        // and real Graph callers (e.g. Maester's license checks) query
+        // subscribedSkus with no $select at all, relying on it being there.
+        if (string.Equals(fullName, "microsoft.graph.subscribedSku", StringComparison.Ordinal))
+        {
+            return [.. SubscribedSkuDefaultProperties];
         }
 
         var scalarNames = GetAllProperties(registry, fullName)

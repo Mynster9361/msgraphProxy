@@ -73,6 +73,14 @@
 		just Invoke-RestMethod) that once it's true, HTTPS calls validate
 		cleanly with no client-side accommodation needed.
 
+	.PARAMETER EntraIDLicense
+		Which Entra ID license tier the mocked tenant's subscribedSkus should
+		report - Free, P1, P2 or Governance. Defaults to P2, so license-gated
+		checks (e.g. Maester's Get-MtLicenseInformation) see a licensed tenant
+		out of the box. Pass -EntraIDLicense explicitly to pick a different
+		tier; the config file's own bundled default is used only when this
+		parameter isn't passed at all.
+
 	.PARAMETER WhatIf
 		If this switch is enabled, no actions are performed but informational
 		messages will be displayed that explain what would happen if the command
@@ -114,7 +122,11 @@
 		$Force,
 
 		[switch]
-		$CI
+		$CI,
+
+		[ValidateSet('Free', 'P1', 'P2', 'Governance')]
+		[string]
+		$EntraIDLicense = 'P2'
 	)
 
 	$existing = Get-MsGraphProxyStatus
@@ -140,10 +152,11 @@
 	}
 
 	$proxyPort = 8000
-	if ($CI) {
-		$ciConfig = New-MsGraphProxyCIConfigFile -ConfigFile $resolvedConfigFile
-		$resolvedConfigFile = $ciConfig.ConfigFile
-		$proxyPort = $ciConfig.ProxyPort
+	if ($CI -or $PSBoundParameters.ContainsKey('EntraIDLicense')) {
+		$licensePreset = Get-MsGraphProxyEntraIDLicensePreset -License $EntraIDLicense
+		$derivedConfig = New-MsGraphProxyCIConfigFile -ConfigFile $resolvedConfigFile -CI:$CI -SubscribedSkus $licensePreset
+		$resolvedConfigFile = $derivedConfig.ConfigFile
+		$proxyPort = $derivedConfig.ProxyPort
 	}
 
 	# Start-Process doesn't quote array elements containing spaces itself, so

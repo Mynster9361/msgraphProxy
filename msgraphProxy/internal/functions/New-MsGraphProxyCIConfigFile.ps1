@@ -1,8 +1,9 @@
 function New-MsGraphProxyCIConfigFile {
 	<#
 	.SYNOPSIS
-		Derives a CI-friendly copy of a devproxyrc.json with certificate
-		auto-install disabled.
+		Derives a modified copy of a devproxyrc.json - certificate auto-install
+		disabled for CI, and/or config overrides like a specific Entra ID
+		license.
 
 	.DESCRIPTION
 		With installCert true (Dev Proxy's default) on Windows, Dev Proxy awaits
@@ -20,17 +21,18 @@ function New-MsGraphProxyCIConfigFile {
 		directly via a raw TLS handshake, which showed a presented certificate
 		of "CN=Dev Proxy CA" instead of a leaf cert for the actual requested
 		host. Any client that validates hostnames will always reject that,
-		regardless of whether the CA itself is trusted.
+		regardless of whether the CA itself is trusted. So this is only ever
+		applied when -CI is passed - never unconditionally - or a normal
+		interactive Windows caller asking only for e.g. a different license
+		would silently lose correct per-domain certificate generation too.
 
 		The blocking OS-trust attempt this whole thing exists to avoid is
 		Windows-only (dev-proxy's ProxyServer is constructed with
 		userTrustRootCertificate: RunTime.IsWindows), so installCert only needs
-		to be forced false on Windows - Linux and macOS never had the deadlock
-		risk in the first place, and forcing it there too was needlessly giving
-		up correct per-domain certificate generation for no benefit. This
-		function now only overrides installCert on Windows; Linux and macOS get
-		the original config back unmodified (still copied alongside the
-		original file, so callers always get a predictable path/port back).
+		to be forced false on Windows under -CI - Linux and macOS never had the
+		deadlock risk in the first place, and forcing it there too was
+		needlessly giving up correct per-domain certificate generation for no
+		benefit.
 
 		The copy is written into the same directory as the original config file,
 		not a temp directory - plugin settings like schemaFilePath/mocksFile are
@@ -38,11 +40,26 @@ function New-MsGraphProxyCIConfigFile {
 		keeping the copy alongside the original preserves those references
 		without needing to know which keys hold them.
 
+		While rewriting the config anyway, this is also where -SubscribedSkus
+		from Start-MsGraphProxy gets applied: it overwrites
+		graphSchemaMockPlugin.subscribedSkus so callers can pick which
+		Entra ID/other license the mocked tenant has (e.g. what
+		Get-MtLicenseInformation would report) without hand-editing
+		devproxyrc.json.
+
 	.PARAMETER ConfigFile
-		Path to the source devproxyrc.json to derive a CI copy from.
+		Path to the source devproxyrc.json to derive a copy from.
+
+	.PARAMETER CI
+		Also disable certificate auto-install on Windows - see DESCRIPTION.
+
+	.PARAMETER SubscribedSkus
+		Replaces graphSchemaMockPlugin.subscribedSkus from the source config -
+		see that plugin's own config shape. Only applied if -SubscribedSkus is
+		passed.
 
 	.EXAMPLE
-		PS C:\> New-MsGraphProxyCIConfigFile -ConfigFile 'C:\proxy\devproxyrc.json'
+		PS C:\> New-MsGraphProxyCIConfigFile -ConfigFile 'C:\proxy\devproxyrc.json' -CI
 
 		Returns an object with the generated config's path and the proxy port
 		it declares (or Dev Proxy's default of 8000 if unset).
@@ -51,13 +68,27 @@ function New-MsGraphProxyCIConfigFile {
 	param (
 		[Parameter(Mandatory)]
 		[string]
-		$ConfigFile
+		$ConfigFile,
+
+		[switch]
+		$CI,
+
+		[object[]]
+		$SubscribedSkus
 	)
 
 	$config = Get-Content -Raw -Path $ConfigFile | ConvertFrom-Json -AsHashtable
-	if ($IsWindows) {
+	if ($CI -and $IsWindows) {
 		$config['installCert'] = $false
 	}
+
+	if ($PSBoundParameters.ContainsKey('SubscribedSkus')) {
+		if (-not $config.ContainsKey('graphSchemaMockPlugin')) {
+			$config['graphSchemaMockPlugin'] = @{}
+		}
+		$config['graphSchemaMockPlugin']['subscribedSkus'] = @($SubscribedSkus)
+	}
+
 	$proxyPort = if ($config.ContainsKey('port')) { [int]$config['port'] } else { 8000 }
 
 	# No leading dot: Dev Proxy's config-file resolution fails to find a

@@ -125,7 +125,19 @@
 	},
 	"graphSchemaMockPlugin": {
 		"schemaFilePath": "graph-schema/v1.0.csdl",
-		"betaSchemaFilePath": "graph-schema/beta.csdl"
+		"betaSchemaFilePath": "graph-schema/beta.csdl",
+		"subscribedSkus": [
+			{
+				"skuPartNumber": "AAD_PREMIUM_P2",
+				"capabilityStatus": "Enabled",
+				"servicePlans": [
+					{
+						"servicePlanId": "eec0eb4f-6444-4f95-aba0-50c24d67f998",
+						"servicePlanName": "AAD_PREMIUM_P2"
+					}
+				]
+			}
+		]
 	},
 	"entraTokenMockPlugin": {
 		"roles": [
