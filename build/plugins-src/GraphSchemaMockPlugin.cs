@@ -90,6 +90,26 @@ public sealed class GraphSchemaMockPlugin(
         public string? ReturnType { get; init; }
     }
 
+    // Mirrors the subset of OData's Org.OData.Capabilities.V1.* vocabulary that
+    // actually changes response shape/validity for this plugin's purposes -
+    // whether $filter/$orderby/$expand are allowed at all for a resource, and
+    // which individual properties are excluded. These annotations are real,
+    // already present in Microsoft's own published CSDL (confirmed directly:
+    // e.g. the "users" entity set's ExpandRestrictions lists "chats",
+    // "joinedTeams", "onPremisesSyncBehavior", "permissionGrants" and "teamwork"
+    // as non-expandable) - without reading them, this plugin was strictly more
+    // permissive than the real API, letting $filter/$orderby/$expand usage pass
+    // against the mock that the real service would reject with a 400.
+    private sealed class QueryRestrictions
+    {
+        public bool Filterable { get; set; } = true;
+        public HashSet<string> NonFilterableProperties { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public bool Sortable { get; set; } = true;
+        public HashSet<string> NonSortableProperties { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public bool Expandable { get; set; } = true;
+        public HashSet<string> NonExpandableProperties { get; } = new(StringComparer.OrdinalIgnoreCase);
+    }
+
     // Everything parsed out of one CSDL file. v1.0 and beta each get their own
     // instance - the two schemas can (and do) disagree about a type's shape, so
     // resolving a request always has to go through exactly one of these, never a
@@ -109,6 +129,17 @@ public sealed class GraphSchemaMockPlugin(
         // "appRoleAssignments" against the real service.
         public Dictionary<string, string> EntitySets { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, string> Singletons { get; } = new(StringComparer.OrdinalIgnoreCase);
+        // Restrictions declared directly against an entity type (e.g. Target=
+        // "microsoft.graph.bitlockerRecoveryKey") - the overwhelmingly dominant
+        // pattern in Graph's real CSDL (confirmed: 73/73 FilterRestrictions,
+        // 96/101 ExpandRestrictions occurrences target a type this way).
+        public Dictionary<string, QueryRestrictions> TypeRestrictions { get; } = new(StringComparer.Ordinal);
+        // Restrictions declared against a specific entity set or singleton (e.g.
+        // Target="microsoft.graph.GraphService/users") - rarer, but takes
+        // precedence over the type-level default when present, same as real
+        // OData annotation resolution. This is where "users" own chats/
+        // joinedTeams/etc. exclusions actually live.
+        public Dictionary<string, QueryRestrictions> EntitySetRestrictions { get; } = new(StringComparer.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -123,6 +154,13 @@ public sealed class GraphSchemaMockPlugin(
     /// ever sets one of them, immediately before returning. When <paramref name="IsValue"/> is
     /// set, <paramref name="TypeFullName"/> is repurposed to hold the resolved property's Edm
     /// type (not an entity type) and <paramref name="PropName"/> holds its real name.
+    ///
+    /// <paramref name="SetOrSingletonName"/> is set only immediately after resolving
+    /// the top-level entity set / singleton segment (segments[0]), and carried
+    /// through a plain collection-to-item transition (the same entity set, just one
+    /// item of it) - but reset to null the moment the path navigates through a
+    /// navigation property, since a restriction declared against, say, "users" as an
+    /// entity set has no bearing on some other type reached from it.
     /// </summary>
     private readonly record struct ResolvedNode(
         string TypeFullName,
@@ -132,7 +170,8 @@ public sealed class GraphSchemaMockPlugin(
         bool IsValue = false,
         bool IsCount = false,
         FunctionActionDef? Operation = null,
-        string? PropName = null);
+        string? PropName = null,
+        string? SetOrSingletonName = null);
 
     private static readonly string[] UserDefaultProperties =
     [
@@ -145,6 +184,67 @@ public sealed class GraphSchemaMockPlugin(
         "id", "accountId", "accountName", "appliesTo", "capabilityStatus",
         "consumedUnits", "prepaidUnits", "servicePlans", "skuId", "skuPartNumber", "subscriptionIds",
     ];
+
+    // The specific set of Microsoft Entra ID (directory) object types real
+    // Graph gates several $filter/$count behaviors behind "advanced query"
+    // mode for - ne/not/endsWith in $filter, $count (as a URL segment, query
+    // parameter, or combined with $orderby) - all require the caller to set
+    // the ConsistencyLevel: eventual header (and, except for $search, pass
+    // $count=true too). Confirmed directly against
+    // https://learn.microsoft.com/graph/aad-advanced-queries: this is an
+    // explicit, narrow allow-list in the real API, not a blanket rule -
+    // every other resource in this mock stays exactly as permissive as
+    // before. $search itself isn't implemented by this plugin at all yet
+    // (a separate, pre-existing gap), so it isn't gated here either.
+    private static readonly HashSet<string> AdvancedQueryDirectoryObjectTypes = new(StringComparer.Ordinal)
+    {
+        "microsoft.graph.administrativeUnit",
+        "microsoft.graph.application",
+        "microsoft.graph.appRoleAssignment",
+        "microsoft.graph.device",
+        "microsoft.graph.group",
+        "microsoft.graph.oAuth2PermissionGrant",
+        "microsoft.graph.orgContact",
+        "microsoft.graph.servicePrincipal",
+        "microsoft.graph.user",
+    };
+
+    // A minimal request shape both a real intercepted HTTP request and a
+    // synthetic $batch sub-request (see HandleBatch) can satisfy. RequestUri
+    // stays a plain System.Uri - not Titanium-specific - so every existing
+    // .RequestUri.Query/.AbsolutePath call site needed no change at all;
+    // only header lookup and the body needed abstracting, since Titanium's
+    // own Request can't be constructed standalone for a synthetic
+    // sub-request (its Body setter is internal to that library, inaccessible
+    // from this plugin's own assembly).
+    private sealed class MockRequest(Uri requestUri, Func<string, string?> getHeader, string? body)
+    {
+        public Uri RequestUri { get; } = requestUri;
+        public string? Body { get; } = body;
+        public string? GetHeader(string name) => getHeader(name);
+
+        public static MockRequest FromRealRequest(Request request) => new(
+            request.RequestUri,
+            name => request.Headers.GetFirstHeader(name)?.Value,
+            request.HasBody ? request.BodyString : null);
+    }
+
+    private static bool HasConsistencyLevelEventual(MockRequest request) =>
+        string.Equals(request.GetHeader("ConsistencyLevel"), "eventual", StringComparison.OrdinalIgnoreCase);
+
+    private static bool HasCountTrue(MockRequest request)
+    {
+        var query = System.Web.HttpUtility.ParseQueryString(request.RequestUri.Query);
+        return string.Equals(query["$count"], "true", StringComparison.OrdinalIgnoreCase);
+    }
+
+    // Mirrors the real error shape for this class of rejection - confirmed
+    // against the doc's own example: same code, same message template
+    // (including the aka.ms link), just with the operator name substituted.
+    private static JsonObject AdvancedQueryRequiredError(string operatorName) =>
+        ODataError(
+            "Request_UnsupportedQuery",
+            $"Operator '{operatorName}' is not supported because the required parameters might be missing. Try adding $count=true query parameter and ConsistencyLevel:eventual header. Refer to https://aka.ms/graph-docs/advanced-queries for more information");
 
     private static readonly Dictionary<string, Func<string>> NameFakes = new(StringComparer.Ordinal)
     {
@@ -235,67 +335,48 @@ public sealed class GraphSchemaMockPlugin(
             return Task.CompletedTask;
         }
 
-        var request = e.Session.HttpClient.Request;
-        var method = request.Method?.ToUpperInvariant() ?? "";
+        var rawRequest = e.Session.HttpClient.Request;
+        var method = rawRequest.Method?.ToUpperInvariant() ?? "";
         if (method is not ("GET" or "POST" or "PATCH" or "PUT" or "DELETE") ||
-            !ProxyUtils.IsGraphUrl(request.RequestUri))
+            !ProxyUtils.IsGraphUrl(rawRequest.RequestUri))
         {
             return Task.CompletedTask;
         }
 
-        var (registry, versionSegment) = ResolveRegistry(request.RequestUri.AbsolutePath);
+        var path = rawRequest.RequestUri.AbsolutePath;
+        var (registry, versionSegment) = ResolveRegistry(path);
         if (registry is null)
         {
             return Task.CompletedTask;
         }
 
-        var path = request.RequestUri.AbsolutePath;
-        var versionIndex = path.IndexOf(versionSegment, StringComparison.OrdinalIgnoreCase);
-        var remainder = path[(versionIndex + versionSegment.Length)..].Trim('/');
-        if (remainder.Length == 0)
+        var request = MockRequest.FromRealRequest(rawRequest);
+
+        // POST {version}/$batch is its own top-level shape - see
+        // https://learn.microsoft.com/graph/json-batching - never routed
+        // through the normal EntitySet/Singleton resolution below.
+        var remainder = path[(path.IndexOf(versionSegment, StringComparison.OrdinalIgnoreCase) + versionSegment.Length)..].Trim('/');
+        if (method == "POST" && string.Equals(remainder, "$batch", StringComparison.OrdinalIgnoreCase))
         {
+            HandleBatch(registry, versionSegment, request, e);
             return Task.CompletedTask;
         }
 
-        var segments = remainder.Split('/', StringSplitOptions.RemoveEmptyEntries);
-        var resolved = ResolvePath(registry, segments);
-        if (resolved is null)
+        var result = ResolveAndProcess(registry, versionSegment, method, path, request);
+        if (result is null)
         {
             Logger.LogRequest("No schema match for this path", MessageType.Skipped, new LoggingContext(e.Session));
             return Task.CompletedTask;
         }
 
-        var node = resolved.Value;
-        if (node.IsValue || node.IsCount)
-        {
-            HandleRawSegment(registry, node, method, request, e);
-            return Task.CompletedTask;
-        }
-
-        var (responseBody, statusCode) = node.IsRef
-            ? HandleRef(node, method, request)
-            : node.Operation is not null
-                ? (node.Operation.IsAction ? HandleAction(registry, node.Operation, method, request) : HandleFunction(registry, node.Operation, method, request))
-                : node.IsCollection
-                    ? HandleCollection(registry, versionSegment, node.TypeFullName, method, request)
-                    : node.ItemId is not null
-                        ? HandleItem(registry, versionSegment, node.TypeFullName, node.ItemId, method, request)
-                        : HandleSingleton(registry, versionSegment, node.TypeFullName, method, request);
-
-        if (statusCode is null)
+        if (result.Value.StatusCode is null)
         {
             // method not supported for this resource shape - let it fall through
             return Task.CompletedTask;
         }
 
-        var requestId = Guid.NewGuid().ToString();
-        var requestDate = DateTime.Now.ToString("r", CultureInfo.InvariantCulture);
-        var headers = ProxyUtils.BuildGraphResponseHeaders(request, requestId, requestDate);
-
-        e.Session.GenericResponse(responseBody?.ToJsonString() ?? string.Empty, statusCode.Value, headers.Select(h => new HttpHeader(h.Name, h.Value)));
-        e.ResponseState.HasBeenSet = true;
-
-        Logger.LogRequest($"{(int)statusCode.Value} schema mock ({node.TypeFullName})", MessageType.Mocked, new LoggingContext(e.Session));
+        WriteResponse(e, result.Value);
+        Logger.LogRequest($"{(int)result.Value.StatusCode.Value} schema mock ({result.Value.LogLabel})", MessageType.Mocked, new LoggingContext(e.Session));
 
         return Task.CompletedTask;
     }
@@ -317,7 +398,191 @@ public sealed class GraphSchemaMockPlugin(
         return (null, "");
     }
 
-    private (JsonNode? Body, HttpStatusCode? StatusCode) HandleCollection(SchemaRegistry registry, string versionSegment, string typeFullName, string method, Request request)
+    // --- $batch (https://learn.microsoft.com/graph/json-batching) ---
+
+    // The doc states batching supports "up to 20" individual requests but
+    // doesn't give a worked example of what happens past that limit or for
+    // a duplicate id - those two rejection messages below are a reasonable
+    // approximation, not a confirmed-verbatim match, unlike the $count/
+    // $search error text elsewhere in this plugin which was checked against
+    // real documented examples.
+    private const int MaxBatchRequests = 20;
+
+    private void HandleBatch(SchemaRegistry registry, string versionSegment, MockRequest request, ProxyRequestArgs e)
+    {
+        var outerBody = ParseBody(request);
+        if (outerBody is null || outerBody["requests"] is not JsonArray requestsArray)
+        {
+            WriteResponse(e, new MockResult(ODataError("BadRequest", "The batch request body must be a JSON object with a 'requests' array."), HttpStatusCode.BadRequest, LogLabel: "$batch: malformed body"));
+            Logger.LogRequest("400 schema mock ($batch: malformed body)", MessageType.Mocked, new LoggingContext(e.Session));
+            return;
+        }
+
+        if (requestsArray.Count > MaxBatchRequests)
+        {
+            WriteResponse(e, new MockResult(ODataError("BadRequest", $"The batch request can contain at most {MaxBatchRequests} individual requests."), HttpStatusCode.BadRequest));
+            Logger.LogRequest("400 schema mock ($batch: too many requests)", MessageType.Mocked, new LoggingContext(e.Session));
+            return;
+        }
+
+        var subRequests = new List<(string Id, string Method, string Url, JsonObject? Headers, string? Body, List<string> DependsOn)>();
+        var seenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in requestsArray)
+        {
+            if (item is not JsonObject sub ||
+                sub["id"] is not JsonValue idNode || !idNode.TryGetValue(out string? id) || string.IsNullOrWhiteSpace(id) ||
+                sub["method"] is not JsonValue methodNode || !methodNode.TryGetValue(out string? subMethod) || string.IsNullOrWhiteSpace(subMethod) ||
+                sub["url"] is not JsonValue urlNode || !urlNode.TryGetValue(out string? url) || string.IsNullOrWhiteSpace(url))
+            {
+                WriteResponse(e, new MockResult(ODataError("BadRequest", "Each entry in 'requests' must have a non-empty 'id', 'method' and 'url'."), HttpStatusCode.BadRequest));
+                Logger.LogRequest("400 schema mock ($batch: malformed sub-request)", MessageType.Mocked, new LoggingContext(e.Session));
+                return;
+            }
+
+            // Not case-sensitive per the doc, and must be unique in the
+            // batch or the whole batch request fails with a 400 - both
+            // confirmed directly in the doc's own property table, just
+            // without a verbatim example error message.
+            if (!seenIds.Add(id))
+            {
+                WriteResponse(e, new MockResult(ODataError("BadRequest", $"Duplicate request id '{id}' in batch."), HttpStatusCode.BadRequest));
+                Logger.LogRequest("400 schema mock ($batch: duplicate id)", MessageType.Mocked, new LoggingContext(e.Session));
+                return;
+            }
+
+            var dependsOn = sub["dependsOn"] is JsonArray dependsOnArray
+                ? dependsOnArray.Select(d => d is JsonValue dv && dv.TryGetValue(out string? dep) ? dep : null).Where(d => d is not null).Select(d => d!).ToList()
+                : [];
+
+            subRequests.Add((id, subMethod.ToUpperInvariant(), url, sub["headers"] as JsonObject, sub["body"] is { } bodyNode ? bodyNode.ToJsonString() : null, dependsOn));
+        }
+
+        foreach (var sub in subRequests)
+        {
+            var unknownDependency = sub.DependsOn.FirstOrDefault(d => !seenIds.Contains(d));
+            if (unknownDependency is not null)
+            {
+                WriteResponse(e, new MockResult(ODataError("BadRequest", $"Request '{sub.Id}' depends on unknown request id '{unknownDependency}'."), HttpStatusCode.BadRequest));
+                Logger.LogRequest("400 schema mock ($batch: unknown dependsOn id)", MessageType.Mocked, new LoggingContext(e.Session));
+                return;
+            }
+        }
+
+        var results = new Dictionary<string, (int Status, JsonNode? Body)>(StringComparer.OrdinalIgnoreCase);
+        var pending = new List<(string Id, string Method, string Url, JsonObject? Headers, string? Body, List<string> DependsOn)>(subRequests);
+
+        // "Batch should be either fully sequential or fully parallel" per
+        // the doc - this mock only ever executes synchronously regardless,
+        // so what actually matters observably is honoring dependsOn
+        // ordering and propagating 424 (Failed Dependency) when a
+        // dependency didn't succeed, both of which this loop does.
+        while (pending.Count > 0)
+        {
+            var progressed = false;
+            for (var i = pending.Count - 1; i >= 0; i--)
+            {
+                var sub = pending[i];
+                if (!sub.DependsOn.TrueForAll(results.ContainsKey))
+                {
+                    continue;
+                }
+
+                var failedDependency = sub.DependsOn.FirstOrDefault(d => results[d].Status >= 400);
+                results[sub.Id] = failedDependency is not null
+                    ? (424, ODataError("Request_Dependency", $"Request depends on '{failedDependency}', which failed."))
+                    : ProcessBatchSubRequest(registry, versionSegment, sub.Method, sub.Url, sub.Headers, sub.Body);
+
+                pending.RemoveAt(i);
+                progressed = true;
+            }
+
+            if (!progressed)
+            {
+                // A circular dependsOn chain - not something a well-formed
+                // client would send, but fail loud rather than loop forever.
+                foreach (var sub in pending)
+                {
+                    results[sub.Id] = (400, ODataError("BadRequest", $"Request '{sub.Id}' is part of a circular dependsOn chain."));
+                }
+
+                break;
+            }
+        }
+
+        // Real Graph doesn't guarantee response order matches request order
+        // (confirmed in the doc - callers correlate via id), so emitting in
+        // dependency-resolved order rather than reconstructing the original
+        // array order is a faithful, not just convenient, choice.
+        var responses = new JsonArray();
+        foreach (var (id, (status, body)) in results)
+        {
+            responses.Add(new JsonObject
+            {
+                ["id"] = id,
+                ["status"] = status,
+                ["body"] = body?.DeepClone(),
+            });
+        }
+
+        WriteResponse(e, new MockResult(new JsonObject { ["responses"] = responses }, HttpStatusCode.OK));
+        Logger.LogRequest($"200 schema mock ($batch: {subRequests.Count} sub-request(s))", MessageType.Mocked, new LoggingContext(e.Session));
+    }
+
+    private (int Status, JsonNode? Body) ProcessBatchSubRequest(SchemaRegistry registry, string versionSegment, string method, string url, JsonObject? headers, string? body)
+    {
+        // Sub-request urls are relative to the same version the outer
+        // $batch call targeted (e.g. "/me/memberOf" or "users?$select=...",
+        // both shown as real examples in the doc) - prefixing with
+        // versionSegment and re-running the exact same resolve/dispatch
+        // path used for a real top-level request is what makes every
+        // $filter/$expand/$search/advanced-query behavior already built
+        // into this plugin work identically inside a batch, for free.
+        var queryIdx = url.IndexOf('?', StringComparison.Ordinal);
+        var query = queryIdx >= 0 ? url[queryIdx..] : "";
+        var path = (queryIdx >= 0 ? url[..queryIdx] : url).TrimStart('/');
+        var absoluteUri = new Uri($"https://graph.microsoft.com{versionSegment}{path}{query}");
+
+        var subRequest = new MockRequest(absoluteUri, name => GetJsonHeader(headers, name), body);
+
+        var result = ResolveAndProcess(registry, versionSegment, method, absoluteUri.AbsolutePath, subRequest);
+        if (result is null)
+        {
+            return ((int)HttpStatusCode.NotFound, ODataError("Request_ResourceNotFound", $"Resource not found for the segment '{url}'."));
+        }
+
+        if (result.Value.StatusCode is null)
+        {
+            // Method genuinely unsupported for this resource shape (e.g.
+            // DELETE on a singleton) - real Graph would 405 here, matching
+            // exactly the shape shown in the doc's own example response
+            // (request 4: "Specified HTTP method is not allowed for the
+            // request target").
+            return ((int)HttpStatusCode.MethodNotAllowed, ODataError("Request_BadRequest", "Specified HTTP method is not allowed for the request target."));
+        }
+
+        var responseBody = result.Value.RawText is not null ? JsonValue.Create(result.Value.RawText) : result.Value.Body;
+        return ((int)result.Value.StatusCode.Value, responseBody);
+    }
+
+    private static string? GetJsonHeader(JsonObject? headers, string name)
+    {
+        if (headers is null)
+        {
+            return null;
+        }
+
+        foreach (var kvp in headers)
+        {
+            if (string.Equals(kvp.Key, name, StringComparison.OrdinalIgnoreCase) && kvp.Value is JsonValue v && v.TryGetValue(out string? s))
+            {
+                return s;
+            }
+        }
+
+        return null;
+    }
+
+    private (JsonNode? Body, HttpStatusCode? StatusCode) HandleCollection(SchemaRegistry registry, string versionSegment, string typeFullName, string method, MockRequest request, QueryRestrictions? restrictions)
     {
         var pool = GetOrSeedPool(registry, typeFullName);
 
@@ -325,17 +590,134 @@ public sealed class GraphSchemaMockPlugin(
         {
             var query = System.Web.HttpUtility.ParseQueryString(request.RequestUri.Query);
             var filterParam = query["$filter"];
+            var orderByParam = query["$orderby"];
 
-            IEnumerable<JsonObject> filtered = pool;
+            FilterNode? filterNode = null;
             if (!string.IsNullOrWhiteSpace(filterParam))
             {
-                var filterNode = TryParseFilter(filterParam);
+                filterNode = TryParseFilter(filterParam);
                 if (filterNode is null)
                 {
                     return (ODataError("BadRequest", $"Unable to parse $filter '{filterParam}'."), HttpStatusCode.BadRequest);
                 }
 
+                if (restrictions is not null)
+                {
+                    if (!restrictions.Filterable)
+                    {
+                        return (ODataError("BadRequest", "$filter is not supported for this resource."), HttpStatusCode.BadRequest);
+                    }
+
+                    var filterProps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    filterNode.CollectPropertyNames(filterProps);
+                    var nonFilterable = filterProps.FirstOrDefault(restrictions.NonFilterableProperties.Contains);
+                    if (nonFilterable is not null)
+                    {
+                        return (ODataError("BadRequest", $"Property '{nonFilterable}' is not filterable."), HttpStatusCode.BadRequest);
+                    }
+                }
+            }
+
+            List<OrderByTerm>? orderByTerms = null;
+            if (!string.IsNullOrWhiteSpace(orderByParam))
+            {
+                orderByTerms = TryParseOrderBy(orderByParam);
+                if (orderByTerms is null)
+                {
+                    return (ODataError("BadRequest", $"Unable to parse $orderby '{orderByParam}'."), HttpStatusCode.BadRequest);
+                }
+
+                if (restrictions is not null)
+                {
+                    if (!restrictions.Sortable)
+                    {
+                        return (ODataError("BadRequest", "$orderby is not supported for this resource."), HttpStatusCode.BadRequest);
+                    }
+
+                    var nonSortable = orderByTerms.Select(t => t.PropName).FirstOrDefault(restrictions.NonSortableProperties.Contains);
+                    if (nonSortable is not null)
+                    {
+                        return (ODataError("BadRequest", $"Property '{nonSortable}' is not sortable."), HttpStatusCode.BadRequest);
+                    }
+                }
+            }
+
+            var expandError = ValidateExpand(registry, typeFullName, request, restrictions);
+            if (expandError is not null)
+            {
+                return (expandError, HttpStatusCode.BadRequest);
+            }
+
+            // Advanced query gate (directory objects only) - see
+            // https://learn.microsoft.com/graph/aad-advanced-queries.
+            // ConsistencyLevel: eventual + $count=true unlock ne/not/endsWith
+            // in $filter and combining $filter with $orderby; without them,
+            // real Graph rejects the request outright rather than silently
+            // degrading, so this mock does the same.
+            var isDirectoryObjectType = AdvancedQueryDirectoryObjectTypes.Contains(typeFullName);
+            var countTrue = HasCountTrue(request);
+            var advancedQueryModeActive = countTrue && HasConsistencyLevelEventual(request);
+
+            if (isDirectoryObjectType && filterNode is not null)
+            {
+                var advancedOperators = new List<string>();
+                filterNode.CollectAdvancedOperators(advancedOperators);
+                if (advancedOperators.Count > 0 && !advancedQueryModeActive)
+                {
+                    return (AdvancedQueryRequiredError(advancedOperators[0]), HttpStatusCode.BadRequest);
+                }
+
+                if (orderByTerms is not null && !advancedQueryModeActive)
+                {
+                    return (AdvancedQueryRequiredError("$orderby"), HttpStatusCode.BadRequest);
+                }
+            }
+
+            // $search on a directory object is its own advanced-query gate,
+            // separate from the ne/not/endsWith/$orderby one above: it needs
+            // only ConsistencyLevel: eventual, not $count=true too (the one
+            // documented exception to "advanced query params" meaning both -
+            // see https://learn.microsoft.com/graph/search-query-parameter).
+            // On any other resource type $search isn't modeled at all by
+            // this plugin - messages/people have their own, unrelated search
+            // semantics (KQL properties, relevance scoring) this plugin
+            // doesn't implement - so it's silently ignored there, unchanged
+            // from this plugin's behavior before $search existed at all.
+            var searchParam = query["$search"];
+            SearchNode? searchNode = null;
+            if (!string.IsNullOrWhiteSpace(searchParam) && isDirectoryObjectType)
+            {
+                if (!HasConsistencyLevelEventual(request))
+                {
+                    return (
+                        ODataError("Request_UnsupportedQuery", "Request with $search query parameter only works through MSGraph with a special request header: 'ConsistencyLevel: eventual'"),
+                        HttpStatusCode.BadRequest);
+                }
+
+                searchNode = TryParseSearch(searchParam);
+                if (searchNode is null)
+                {
+                    return (ODataError("BadRequest", $"Unable to parse $search '{searchParam}'."), HttpStatusCode.BadRequest);
+                }
+            }
+
+            IEnumerable<JsonObject> filtered = pool;
+            if (filterNode is not null)
+            {
                 filtered = filtered.Where(filterNode.Evaluate);
+            }
+
+            // Real Graph ANDs $filter and $search together when both are
+            // present (confirmed in the doc) - exactly what chaining a
+            // second .Where() gives for free.
+            if (searchNode is not null)
+            {
+                filtered = filtered.Where(searchNode.Evaluate);
+            }
+
+            if (orderByTerms is not null)
+            {
+                filtered = ApplyOrderBy(filtered, orderByTerms);
             }
 
             var selectedProps = GetSelectedProps(registry, typeFullName, request);
@@ -347,7 +729,19 @@ public sealed class GraphSchemaMockPlugin(
                 array.Add(trimmed);
             }
 
-            return (new JsonObject { ["@odata.context"] = BuildODataContext(versionSegment, request), ["value"] = array }, HttpStatusCode.OK);
+            var responseBody = new JsonObject { ["@odata.context"] = BuildODataContext(versionSegment, request), ["value"] = array };
+
+            // $count=true on a non-directory-object resource is plain OData,
+            // honored unconditionally; on a directory object it's gated the
+            // same as everything else above - real Graph "silently ignores"
+            // it rather than erroring (confirmed in the doc), so this just
+            // omits @odata.count instead of rejecting the request.
+            if (countTrue && (!isDirectoryObjectType || advancedQueryModeActive))
+            {
+                responseBody["@odata.count"] = array.Count;
+            }
+
+            return (responseBody, HttpStatusCode.OK);
         }
 
         if (method == "POST")
@@ -385,7 +779,7 @@ public sealed class GraphSchemaMockPlugin(
     // object would try to add it again and fail with "member already
     // exists". Matching real Graph's shape avoids that and is simply more
     // schema-accurate besides.
-    private static string BuildODataContext(string versionSegment, Request request)
+    private static string BuildODataContext(string versionSegment, MockRequest request)
     {
         var path = request.RequestUri.AbsolutePath;
         var versionIndex = path.IndexOf(versionSegment, StringComparison.OrdinalIgnoreCase);
@@ -400,7 +794,7 @@ public sealed class GraphSchemaMockPlugin(
         return $"{request.RequestUri.Scheme}://{request.RequestUri.Host}{versionSegment}$metadata#{firstSegment}";
     }
 
-    private (JsonNode? Body, HttpStatusCode? StatusCode) HandleItem(SchemaRegistry registry, string versionSegment, string typeFullName, string itemId, string method, Request request)
+    private (JsonNode? Body, HttpStatusCode? StatusCode) HandleItem(SchemaRegistry registry, string versionSegment, string typeFullName, string itemId, string method, MockRequest request, QueryRestrictions? restrictions)
     {
         var pool = GetOrSeedPool(registry, typeFullName);
         var existing = FindById(pool, itemId);
@@ -414,6 +808,12 @@ public sealed class GraphSchemaMockPlugin(
         {
             case "GET":
                 {
+                    var expandError = ValidateExpand(registry, typeFullName, request, restrictions);
+                    if (expandError is not null)
+                    {
+                        return (expandError, HttpStatusCode.BadRequest);
+                    }
+
                     var trimmed = TrimTo(existing, GetSelectedProps(registry, typeFullName, request));
                     ApplyExpand(registry, trimmed, typeFullName, request);
                     trimmed["@odata.context"] = BuildODataContext(versionSegment, request) + "/$entity";
@@ -438,7 +838,7 @@ public sealed class GraphSchemaMockPlugin(
         }
     }
 
-    private (JsonNode? Body, HttpStatusCode? StatusCode) HandleSingleton(SchemaRegistry registry, string versionSegment, string typeFullName, string method, Request request)
+    private (JsonNode? Body, HttpStatusCode? StatusCode) HandleSingleton(SchemaRegistry registry, string versionSegment, string typeFullName, string method, MockRequest request, QueryRestrictions? restrictions)
     {
         if (method is not ("GET" or "PATCH" or "PUT"))
         {
@@ -456,6 +856,14 @@ public sealed class GraphSchemaMockPlugin(
                 MergeInto(record, bodyObj);
             }
         }
+        else
+        {
+            var expandError = ValidateExpand(registry, typeFullName, request, restrictions);
+            if (expandError is not null)
+            {
+                return (expandError, HttpStatusCode.BadRequest);
+            }
+        }
 
         var trimmedRecord = TrimTo(record, GetSelectedProps(registry, typeFullName, request));
         ApplyExpand(registry, trimmedRecord, typeFullName, request);
@@ -469,7 +877,7 @@ public sealed class GraphSchemaMockPlugin(
     // it validates the request shape and reports the same success/failure a
     // real add/remove/set-reference call would, which is enough for callers
     // exercising that flow rather than asserting on the resulting membership.
-    private static (JsonNode? Body, HttpStatusCode? StatusCode) HandleRef(ResolvedNode node, string method, Request request)
+    private static (JsonNode? Body, HttpStatusCode? StatusCode) HandleRef(ResolvedNode node, string method, MockRequest request)
     {
         if (node.ItemId is not null)
         {
@@ -494,7 +902,7 @@ public sealed class GraphSchemaMockPlugin(
         };
     }
 
-    private static (JsonNode? Body, HttpStatusCode? StatusCode) HandleAddRef(Request request)
+    private static (JsonNode? Body, HttpStatusCode? StatusCode) HandleAddRef(MockRequest request)
     {
         var bodyObj = ParseBody(request);
         if (bodyObj is null || !bodyObj.ContainsKey("@odata.id"))
@@ -517,7 +925,7 @@ public sealed class GraphSchemaMockPlugin(
 
     // Bound Functions/Actions don't model their parameters, so request bodies and
     // parenthesized arguments are ignored - only the ReturnType shape is fabricated.
-    private static (JsonNode? Body, HttpStatusCode? StatusCode) HandleFunction(SchemaRegistry registry, FunctionActionDef op, string method, Request request)
+    private static (JsonNode? Body, HttpStatusCode? StatusCode) HandleFunction(SchemaRegistry registry, FunctionActionDef op, string method, MockRequest request)
     {
         if (method != "GET")
         {
@@ -527,7 +935,7 @@ public sealed class GraphSchemaMockPlugin(
         return BuildOperationResult(registry, op.ReturnType);
     }
 
-    private static (JsonNode? Body, HttpStatusCode? StatusCode) HandleAction(SchemaRegistry registry, FunctionActionDef op, string method, Request request)
+    private static (JsonNode? Body, HttpStatusCode? StatusCode) HandleAction(SchemaRegistry registry, FunctionActionDef op, string method, MockRequest request)
     {
         if (method != "POST")
         {
@@ -550,25 +958,104 @@ public sealed class GraphSchemaMockPlugin(
             : (value as JsonObject ?? new JsonObject { ["value"] = value }, HttpStatusCode.OK);
     }
 
-    private void HandleRawSegment(SchemaRegistry registry, ResolvedNode node, string method, Request request, ProxyRequestArgs e)
+    // RawText, not Body, for the $value/$count text/plain shape - kept as a
+    // separate field rather than stuffing a raw string into a JsonValue and
+    // relying on JsonNode.ToString() to hand it back unquoted later, which
+    // isn't a documented guarantee worth depending on.
+    private readonly record struct MockResult(JsonNode? Body, HttpStatusCode? StatusCode, string? RawText = null, string? LogLabel = null);
+
+    private MockResult HandleRawSegmentValue(SchemaRegistry registry, ResolvedNode node, string method, MockRequest request)
     {
         if (method != "GET")
         {
             // falls through unmocked, consistent with the (null, null) convention elsewhere
-            return;
+            return default;
+        }
+
+        // /$count as a URL segment on a directory object also needs
+        // ConsistencyLevel: eventual - a different error shape than the
+        // $filter-operator gate in HandleCollection (Request_BadRequest, not
+        // Request_UnsupportedQuery), confirmed against the doc's own example.
+        if (node.IsCount && AdvancedQueryDirectoryObjectTypes.Contains(node.TypeFullName) && !HasConsistencyLevelEventual(request))
+        {
+            return new MockResult(ODataError("Request_BadRequest", "$count is not currently supported."), HttpStatusCode.BadRequest, LogLabel: "$count without ConsistencyLevel");
         }
 
         var rawBody = node.IsCount
             ? GetOrSeedPool(registry, node.TypeFullName).Count.ToString(CultureInfo.InvariantCulture)
             : FakePrimitive(node.TypeFullName, node.PropName ?? "value")?.ToString() ?? "";
 
-        e.Session.GenericResponse(rawBody, HttpStatusCode.OK, [new HttpHeader("Content-Type", "text/plain")]);
-        e.ResponseState.HasBeenSet = true;
-
-        Logger.LogRequest($"200 schema mock ({(node.IsCount ? "$count" : "$value")})", MessageType.Mocked, new LoggingContext(e.Session));
+        return new MockResult(null, HttpStatusCode.OK, RawText: rawBody, LogLabel: node.IsCount ? "$count" : "$value");
     }
 
-    private static List<string> GetSelectedProps(SchemaRegistry registry, string typeFullName, Request request)
+    // Shared by the top-level dispatch in BeforeRequestAsync and by each
+    // $batch sub-request (see HandleBatch) - resolving a (method, path)
+    // pair against the schema and producing a result is identical either
+    // way, only how the caller learned about the request and what it does
+    // with the result differs. Returns null specifically for "nothing in the
+    // schema matches this path at all" (distinct from a MockResult with a
+    // null StatusCode, which means "resolved to a real resource, but this
+    // HTTP method isn't supported for that resource shape") - callers treat
+    // the two differently (only the former logs "No schema match").
+    private MockResult? ResolveAndProcess(SchemaRegistry registry, string versionSegment, string method, string absolutePath, MockRequest request)
+    {
+        var versionIndex = absolutePath.IndexOf(versionSegment, StringComparison.OrdinalIgnoreCase);
+        if (versionIndex < 0)
+        {
+            return null;
+        }
+
+        var remainder = absolutePath[(versionIndex + versionSegment.Length)..].Trim('/');
+        if (remainder.Length == 0)
+        {
+            return null;
+        }
+
+        var segments = remainder.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var resolved = ResolvePath(registry, segments);
+        if (resolved is null)
+        {
+            return null;
+        }
+
+        var node = resolved.Value;
+        if (node.IsValue || node.IsCount)
+        {
+            return HandleRawSegmentValue(registry, node, method, request);
+        }
+
+        var restrictions = GetRestrictions(registry, node.SetOrSingletonName, node.TypeFullName);
+        var (responseBody, statusCode) = node.IsRef
+            ? HandleRef(node, method, request)
+            : node.Operation is not null
+                ? (node.Operation.IsAction ? HandleAction(registry, node.Operation, method, request) : HandleFunction(registry, node.Operation, method, request))
+                : node.IsCollection
+                    ? HandleCollection(registry, versionSegment, node.TypeFullName, method, request, restrictions)
+                    : node.ItemId is not null
+                        ? HandleItem(registry, versionSegment, node.TypeFullName, node.ItemId, method, request, restrictions)
+                        : HandleSingleton(registry, versionSegment, node.TypeFullName, method, request, restrictions);
+
+        return new MockResult(responseBody, statusCode, LogLabel: node.TypeFullName);
+    }
+
+    private static void WriteResponse(ProxyRequestArgs e, MockResult result)
+    {
+        if (result.RawText is not null)
+        {
+            e.Session.GenericResponse(result.RawText, result.StatusCode!.Value, [new HttpHeader("Content-Type", "text/plain")]);
+        }
+        else
+        {
+            var requestId = Guid.NewGuid().ToString();
+            var requestDate = DateTime.Now.ToString("r", CultureInfo.InvariantCulture);
+            var headers = ProxyUtils.BuildGraphResponseHeaders(e.Session.HttpClient.Request, requestId, requestDate);
+            e.Session.GenericResponse(result.Body?.ToJsonString() ?? string.Empty, result.StatusCode!.Value, headers.Select(h => new HttpHeader(h.Name, h.Value)));
+        }
+
+        e.ResponseState.HasBeenSet = true;
+    }
+
+    private static List<string> GetSelectedProps(SchemaRegistry registry, string typeFullName, MockRequest request)
     {
         var query = System.Web.HttpUtility.ParseQueryString(request.RequestUri.Query);
         var selectParam = query["$select"];
@@ -660,9 +1147,9 @@ public sealed class GraphSchemaMockPlugin(
         return null;
     }
 
-    private static JsonObject? ParseBody(Request request)
+    private static JsonObject? ParseBody(MockRequest request)
     {
-        var bodyString = request.BodyString;
+        var bodyString = request.Body;
         if (string.IsNullOrWhiteSpace(bodyString))
         {
             return null;
@@ -693,11 +1180,11 @@ public sealed class GraphSchemaMockPlugin(
         ResolvedNode current;
         if (registry.EntitySets.TryGetValue(segments[0], out var entitySetType))
         {
-            current = new ResolvedNode(ResolveRefName(registry, entitySetType), true, null);
+            current = new ResolvedNode(ResolveRefName(registry, entitySetType), true, null, SetOrSingletonName: segments[0]);
         }
         else if (registry.Singletons.TryGetValue(segments[0], out var singletonType))
         {
-            current = new ResolvedNode(ResolveRefName(registry, singletonType), false, null);
+            current = new ResolvedNode(ResolveRefName(registry, singletonType), false, null, SetOrSingletonName: segments[0]);
         }
         else
         {
@@ -739,8 +1226,11 @@ public sealed class GraphSchemaMockPlugin(
                     return isLast ? current with { Operation = collectionOp } : null;
                 }
 
-                // a segment right after a collection is always an item id
-                current = new ResolvedNode(current.TypeFullName, false, segment);
+                // a segment right after a collection is always an item id - `with`
+                // (not a fresh ResolvedNode) so SetOrSingletonName survives: a
+                // restriction against the "users" entity set still applies to
+                // GET /users/{id}, not just the bare collection.
+                current = current with { IsCollection = false, ItemId = segment };
                 continue;
             }
 
@@ -969,13 +1459,63 @@ public sealed class GraphSchemaMockPlugin(
 
     // --- $expand ---
 
+    // Checked once up front (not per-item inside ApplyExpand's loop, which runs once
+    // per row in a collection response) since the answer never varies per-item -
+    // only the requested $expand param and the resource's own restrictions matter.
+    // A restricted-but-otherwise-known nav property name is a real 400 in the real
+    // API (e.g. "Expand not supported for property 'chats'" on /users) - unlike an
+    // unrecognized name entirely, which ApplyExpand still silently skips, since that
+    // case was never about a genuine restriction.
+    private static JsonObject? ValidateExpand(SchemaRegistry registry, string typeFullName, MockRequest request, QueryRestrictions? restrictions)
+    {
+        if (restrictions is null)
+        {
+            return null;
+        }
+
+        var query = System.Web.HttpUtility.ParseQueryString(request.RequestUri.Query);
+        var expandParam = query["$expand"];
+        if (string.IsNullOrWhiteSpace(expandParam))
+        {
+            return null;
+        }
+
+        if (!restrictions.Expandable)
+        {
+            return ODataError("BadRequest", "$expand is not supported for this resource.");
+        }
+
+        if (restrictions.NonExpandableProperties.Count == 0)
+        {
+            return null;
+        }
+
+        var navProps = GetAllNavigationProperties(registry, typeFullName);
+        foreach (var raw in expandParam.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var parenIdx = raw.IndexOf('(', StringComparison.Ordinal);
+            var name = parenIdx >= 0 ? raw[..parenIdx] : raw;
+
+            foreach (var nav in navProps)
+            {
+                if (string.Equals(nav.Name, name, StringComparison.OrdinalIgnoreCase) &&
+                    restrictions.NonExpandableProperties.Contains(nav.Name))
+                {
+                    return ODataError("BadRequest", $"Expand not supported for property '{nav.Name}'.");
+                }
+            }
+        }
+
+        return null;
+    }
+
     // Reuses BuildValue - the same recursive fabrication already used for nested
     // complex-type properties - rather than a parallel path, so expanded nav
     // properties get the same MaxDepth-capped, schema-accurate shape. Must run
     // after TrimTo, mutating the trimmed object: otherwise an expanded property
     // absent from $select/DefaultProps would immediately be stripped back out,
     // whereas real Graph always surfaces an expanded property regardless of $select.
-    private static void ApplyExpand(SchemaRegistry registry, JsonObject target, string typeFullName, Request request)
+    private static void ApplyExpand(SchemaRegistry registry, JsonObject target, string typeFullName, MockRequest request)
     {
         var query = System.Web.HttpUtility.ParseQueryString(request.RequestUri.Query);
         var expandParam = query["$expand"];
@@ -1012,6 +1552,57 @@ public sealed class GraphSchemaMockPlugin(
         }
     }
 
+    // --- $orderby ---
+
+    private sealed record OrderByTerm(string PropName, bool Descending);
+
+    // Supports "prop", "prop asc" and "prop desc", comma-separated - no nested
+    // property paths, same scope limitation as $filter above. Returns null on any
+    // malformed term, which the caller turns into a 400 rather than silently
+    // ignoring the sort.
+    private static List<OrderByTerm>? TryParseOrderBy(string orderBy)
+    {
+        var terms = new List<OrderByTerm>();
+        foreach (var raw in orderBy.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var parts = raw.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            switch (parts.Length)
+            {
+                case 1:
+                    terms.Add(new OrderByTerm(parts[0], Descending: false));
+                    break;
+                case 2 when string.Equals(parts[1], "desc", StringComparison.OrdinalIgnoreCase):
+                    terms.Add(new OrderByTerm(parts[0], Descending: true));
+                    break;
+                case 2 when string.Equals(parts[1], "asc", StringComparison.OrdinalIgnoreCase):
+                    terms.Add(new OrderByTerm(parts[0], Descending: false));
+                    break;
+                default:
+                    return null;
+            }
+        }
+
+        return terms.Count > 0 ? terms : null;
+    }
+
+    // A stable multi-key sort (OrderBy/ThenBy, not List.Sort) so items that tie on
+    // every requested property keep their original relative order, same as real
+    // Graph's own $orderby behavior.
+    private static IEnumerable<JsonObject> ApplyOrderBy(IEnumerable<JsonObject> source, List<OrderByTerm> terms)
+    {
+        var comparer = Comparer<string>.Create(CompareStrings);
+        IOrderedEnumerable<JsonObject>? ordered = null;
+        foreach (var term in terms)
+        {
+            string KeySelector(JsonObject item) => FindPropertyValue(item, term.PropName)?.ToString() ?? "";
+            ordered = ordered is null
+                ? term.Descending ? source.OrderByDescending(KeySelector, comparer) : source.OrderBy(KeySelector, comparer)
+                : term.Descending ? ordered.ThenByDescending(KeySelector, comparer) : ordered.ThenBy(KeySelector, comparer);
+        }
+
+        return ordered ?? source;
+    }
+
     // --- $filter ---
 
     // Evaluated generically against whatever properties the plugin already
@@ -1020,35 +1611,80 @@ public sealed class GraphSchemaMockPlugin(
     private abstract record FilterNode
     {
         public abstract bool Evaluate(JsonObject item);
+
+        // Feeds the restriction check in HandleCollection: real Graph rejects
+        // $filter on properties FilterRestrictions marks non-filterable, so the
+        // set of property names an expression actually touches has to be known
+        // before evaluating it against the pool.
+        public abstract void CollectPropertyNames(HashSet<string> names);
+
+        // Feeds the advanced-query gate in HandleCollection: on directory
+        // objects, ne/not/endsWith anywhere in the expression require
+        // ConsistencyLevel: eventual + $count=true - see
+        // https://learn.microsoft.com/graph/aad-advanced-queries. "in" is
+        // deliberately not gated: the doc states it's supported by default
+        // wherever "eq" is.
+        public abstract void CollectAdvancedOperators(List<string> operators);
     }
 
     private sealed record NotNode(FilterNode Inner) : FilterNode
     {
         public override bool Evaluate(JsonObject item) => !Inner.Evaluate(item);
+        public override void CollectPropertyNames(HashSet<string> names) => Inner.CollectPropertyNames(names);
+
+        public override void CollectAdvancedOperators(List<string> operators)
+        {
+            operators.Add("not");
+            Inner.CollectAdvancedOperators(operators);
+        }
     }
 
     private sealed record LogicalNode(FilterNode Left, FilterNode Right, bool IsAnd) : FilterNode
     {
         public override bool Evaluate(JsonObject item) =>
             IsAnd ? Left.Evaluate(item) && Right.Evaluate(item) : Left.Evaluate(item) || Right.Evaluate(item);
+
+        public override void CollectPropertyNames(HashSet<string> names)
+        {
+            Left.CollectPropertyNames(names);
+            Right.CollectPropertyNames(names);
+        }
+
+        public override void CollectAdvancedOperators(List<string> operators)
+        {
+            Left.CollectAdvancedOperators(operators);
+            Right.CollectAdvancedOperators(operators);
+        }
     }
 
-    private sealed record ComparisonNode(string PropName, string Op, string Literal) : FilterNode
+    // Distinguishes the unquoted `null` literal (a real null check) from the
+    // quoted string `'null'` (an ordinary string comparison) - the tokenizer
+    // already strips quotes before a literal reaches a FilterNode, so this has
+    // to be captured at parse time, before UnwrapFilterLiteral runs.
+    private readonly record struct FilterLiteral(string Value, bool IsNull);
+
+    private sealed record ComparisonNode(string PropName, string Op, FilterLiteral Literal) : FilterNode
     {
         public override bool Evaluate(JsonObject item)
         {
             var value = FindPropertyValue(item, PropName);
+
+            // "prop eq null" / "prop ne null" - real Graph's documented pattern
+            // for checking whether a property is unset (e.g. "companyName ne
+            // null"). A missing property and a property whose JSON value is
+            // itself null are indistinguishable once resolved through
+            // FindPropertyValue - both correctly count as "is null" here.
+            if (Literal.IsNull && Op is "eq" or "ne")
+            {
+                return Op == "eq" ? value is null : value is not null;
+            }
+
             if (value is null)
             {
                 return false;
             }
 
-            var cmp = CompareValues(value, Literal);
-            if (cmp is null)
-            {
-                return false;
-            }
-
+            var cmp = CompareStrings(value.ToString(), Literal.Value);
             return Op switch
             {
                 "eq" => cmp == 0,
@@ -1061,23 +1697,42 @@ public sealed class GraphSchemaMockPlugin(
             };
         }
 
-        private static int? CompareValues(JsonValue value, string literal)
+        public override void CollectPropertyNames(HashSet<string> names) => names.Add(PropName);
+
+        public override void CollectAdvancedOperators(List<string> operators)
         {
-            var valueStr = value.ToString();
-
-            if (DateTimeOffset.TryParse(literal, CultureInfo.InvariantCulture, DateTimeStyles.None, out var literalDate) &&
-                DateTimeOffset.TryParse(valueStr, CultureInfo.InvariantCulture, DateTimeStyles.None, out var valueDate))
+            if (Op == "ne")
             {
-                return valueDate.CompareTo(literalDate);
+                operators.Add("ne");
+            }
+        }
+    }
+
+    // "prop in (lit1, lit2, ...)" - equivalent to an OR-chain of eq comparisons,
+    // which is exactly how it's evaluated; a separate node only because the
+    // syntax (a parenthesized literal list, not a single right-hand operand)
+    // doesn't fit ComparisonNode's shape.
+    private sealed record InNode(string PropName, List<FilterLiteral> Literals) : FilterNode
+    {
+        public override bool Evaluate(JsonObject item)
+        {
+            var value = FindPropertyValue(item, PropName);
+            foreach (var literal in Literals)
+            {
+                if (literal.IsNull ? value is null : value is not null && CompareStrings(value.ToString(), literal.Value) == 0)
+                {
+                    return true;
+                }
             }
 
-            if (double.TryParse(literal, NumberStyles.Float, CultureInfo.InvariantCulture, out var literalNum) &&
-                double.TryParse(valueStr, NumberStyles.Float, CultureInfo.InvariantCulture, out var valueNum))
-            {
-                return valueNum.CompareTo(literalNum);
-            }
+            return false;
+        }
 
-            return string.CompareOrdinal(valueStr, literal);
+        public override void CollectPropertyNames(HashSet<string> names) => names.Add(PropName);
+
+        // Not gated: "in" works by default wherever "eq" does, per the doc.
+        public override void CollectAdvancedOperators(List<string> operators)
+        {
         }
     }
 
@@ -1100,15 +1755,73 @@ public sealed class GraphSchemaMockPlugin(
                 _ => false,
             };
         }
+
+        public override void CollectPropertyNames(HashSet<string> names) => names.Add(PropName);
+
+        public override void CollectAdvancedOperators(List<string> operators)
+        {
+            if (FuncName == "endswith")
+            {
+                operators.Add("endsWith");
+            }
+        }
     }
 
-    private static JsonValue? FindPropertyValue(JsonObject item, string propName)
+    // Shared by $filter's ComparisonNode/InNode and $orderby's sort comparer -
+    // date- and number-aware where possible, falling back to ordinal string
+    // comparison (matches this plugin's existing $filter semantics, not
+    // attempting real OData collation).
+    private static int CompareStrings(string left, string right)
     {
-        foreach (var kvp in item)
+        if (DateTimeOffset.TryParse(left, CultureInfo.InvariantCulture, DateTimeStyles.None, out var leftDate) &&
+            DateTimeOffset.TryParse(right, CultureInfo.InvariantCulture, DateTimeStyles.None, out var rightDate))
         {
-            if (string.Equals(kvp.Key, propName, StringComparison.OrdinalIgnoreCase))
+            return leftDate.CompareTo(rightDate);
+        }
+
+        if (double.TryParse(left, NumberStyles.Float, CultureInfo.InvariantCulture, out var leftNum) &&
+            double.TryParse(right, NumberStyles.Float, CultureInfo.InvariantCulture, out var rightNum))
+        {
+            return leftNum.CompareTo(rightNum);
+        }
+
+        return string.CompareOrdinal(left, right);
+    }
+
+    // Walks a '/'-delimited path (e.g. "from/emailAddress/address",
+    // "passwordProfile/forceChangePasswordNextSignIn") through nested complex-
+    // type properties - which this plugin's BuildObject already fabricates in
+    // full, since they're structural Properties, not NavigationProperties. A
+    // path segment that resolves to a navigation property (e.g. "manager/...")
+    // still can't be walked, though: navigation properties are never part of
+    // the underlying pool item, only added on demand by $expand onto a
+    // *trimmed copy* $filter never sees - that's an inherent limit of this
+    // plugin's one-pool-per-type model, not something a smarter path walk
+    // could work around.
+    private static JsonValue? FindPropertyValue(JsonObject item, string propPath)
+    {
+        var segments = propPath.Split('/');
+        var current = item;
+        for (var i = 0; i < segments.Length - 1; i++)
+        {
+            if (FindChild(current, segments[i]) is not JsonObject next)
             {
-                return kvp.Value as JsonValue;
+                return null;
+            }
+
+            current = next;
+        }
+
+        return FindChild(current, segments[^1]) as JsonValue;
+    }
+
+    private static JsonNode? FindChild(JsonObject obj, string name)
+    {
+        foreach (var kvp in obj)
+        {
+            if (string.Equals(kvp.Key, name, StringComparison.OrdinalIgnoreCase))
+            {
+                return kvp.Value;
             }
         }
 
@@ -1121,10 +1834,13 @@ public sealed class GraphSchemaMockPlugin(
     private static readonly HashSet<string> FilterFunctionNames = new(StringComparer.OrdinalIgnoreCase) { "startswith", "contains", "endswith" };
     private static readonly Regex FilterTokenRegex = new(@"'(?:[^']|'')*'|[()]|,|[^\s()',]+", RegexOptions.None, TimeSpan.FromSeconds(5));
 
-    // Supports eq/ne/gt/lt/ge/le, and/or/not, and startswith/contains/endswith on
-    // top-level scalar properties only - no lambda operators (any/all), no nested
-    // property paths, no date arithmetic. Returns null on any parse failure, which
-    // the caller turns into a 400 rather than silently ignoring the filter.
+    // Supports eq/ne/gt/lt/ge/le, and/or/not, in, startswith/contains/endswith,
+    // and '/'-separated paths through nested complex-type properties. Still out
+    // of scope: the any/all lambda operators, has, and the $count-on-collection
+    // pseudo-property - all explicitly advanced-query-gated or rare enough in
+    // real Graph usage that they're a separate, larger piece of work rather
+    // than folded in here. Returns null on any parse failure, which the caller
+    // turns into a 400 rather than silently ignoring the filter.
     private static FilterNode? TryParseFilter(string filter)
     {
         var tokens = FilterTokenRegex.Matches(filter).Select(m => m.Value).ToList();
@@ -1211,11 +1927,41 @@ public sealed class GraphSchemaMockPlugin(
             return new FunctionCallNode(funcName, propName, literal);
         }
 
+        if (pos + 2 < tokens.Count && string.Equals(tokens[pos + 1], "in", StringComparison.OrdinalIgnoreCase) && tokens[pos + 2] == "(")
+        {
+            var propName = tokens[pos];
+            pos += 3;
+
+            var literals = new List<FilterLiteral>();
+            while (pos < tokens.Count && tokens[pos] != ")")
+            {
+                literals.Add(ParseLiteral(tokens[pos]));
+                pos++;
+                if (pos < tokens.Count && tokens[pos] == ",")
+                {
+                    pos++;
+                }
+                else if (pos < tokens.Count && tokens[pos] != ")")
+                {
+                    // a comma has to separate every entry except the last
+                    return null;
+                }
+            }
+
+            if (literals.Count == 0 || pos >= tokens.Count || tokens[pos] != ")")
+            {
+                return null;
+            }
+
+            pos++;
+            return new InNode(propName, literals);
+        }
+
         if (pos + 2 < tokens.Count && FilterComparisonOps.Contains(tokens[pos + 1]))
         {
             var propName = tokens[pos];
             var op = tokens[pos + 1].ToLowerInvariant();
-            var literal = UnwrapFilterLiteral(tokens[pos + 2]);
+            var literal = ParseLiteral(tokens[pos + 2]);
             pos += 3;
             return new ComparisonNode(propName, op, literal);
         }
@@ -1223,10 +1969,223 @@ public sealed class GraphSchemaMockPlugin(
         return null;
     }
 
+    private static FilterLiteral ParseLiteral(string token) => new(
+        UnwrapFilterLiteral(token),
+        IsNull: token.Length > 0 && token[0] != '\'' && string.Equals(token, "null", StringComparison.OrdinalIgnoreCase));
+
     private static string UnwrapFilterLiteral(string token) =>
         token.Length >= 2 && token[0] == '\'' && token[^1] == '\''
             ? token[1..^1].Replace("''", "'", StringComparison.Ordinal)
             : token;
+
+    // --- $search (directory objects only) ---
+
+    private abstract record SearchNode
+    {
+        public abstract bool Evaluate(JsonObject item);
+    }
+
+    private sealed record SearchLogicalNode(SearchNode Left, SearchNode Right, bool IsAnd) : SearchNode
+    {
+        public override bool Evaluate(JsonObject item) =>
+            IsAnd ? Left.Evaluate(item) && Right.Evaluate(item) : Left.Evaluate(item) || Right.Evaluate(item);
+    }
+
+    // Real Graph's tokenized matching only applies to displayName/description
+    // - every other string property falls back to plain $filter startswith
+    // semantics (both confirmed directly in the doc). "true search" (token-set
+    // containment, order-independent, case-insensitive) is what makes
+    // "McGowan Irene" match a displayName of "Irene McGowan".
+    private sealed record SearchClauseNode(string PropName, string Text) : SearchNode
+    {
+        private static readonly string[] TokenizedProperties = ["displayName", "description"];
+
+        public override bool Evaluate(JsonObject item)
+        {
+            var value = FindPropertyValue(item, PropName);
+            if (value is null)
+            {
+                return false;
+            }
+
+            if (TokenizedProperties.Contains(PropName, StringComparer.OrdinalIgnoreCase))
+            {
+                var searchTokens = Tokenize(Text);
+                if (searchTokens.Count == 0)
+                {
+                    return false;
+                }
+
+                var valueTokens = Tokenize(value.ToString());
+                return searchTokens.All(valueTokens.Contains);
+            }
+
+            return value.ToString().StartsWith(Text, StringComparison.Ordinal);
+        }
+    }
+
+    // A simplified approximation of Microsoft's real tokenizer (documented at
+    // https://learn.microsoft.com/graph/search-query-parameter): splits on
+    // non-alphanumeric runs, lower-to-upper case transitions (camelCase), and
+    // letter/digit transitions, lowercasing everything for comparison. Doesn't
+    // replicate the real tokenizer's extra quirk of also emitting symbols as
+    // their own token and a no-separator concatenated variant (e.g.
+    // "hello.world" additionally tokenizing to a bare "helloworld") - a mock
+    // doesn't need that level of fidelity to be useful for testing that
+    // tokenized (not substring) matching is happening at all.
+    private static HashSet<string> Tokenize(string input)
+    {
+        var tokens = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var start = 0;
+        char? prev = null;
+
+        void Flush(int end)
+        {
+            if (end > start)
+            {
+                tokens.Add(input[start..end].ToLowerInvariant());
+            }
+        }
+
+        for (var i = 0; i < input.Length; i++)
+        {
+            var c = input[i];
+            if (!char.IsLetterOrDigit(c))
+            {
+                Flush(i);
+                start = i + 1;
+                prev = null;
+                continue;
+            }
+
+            if (prev is { } p && ((char.IsLower(p) && char.IsUpper(c)) || (char.IsDigit(p) != char.IsDigit(c))))
+            {
+                Flush(i);
+                start = i;
+            }
+
+            prev = c;
+        }
+
+        Flush(input.Length);
+        return tokens;
+    }
+
+    private static readonly Regex SearchTokenRegex = new("\"(?:[^\"\\\\]|\\\\.)*\"|[()]|[^\\s()]+", RegexOptions.None, TimeSpan.FromSeconds(5));
+
+    // General format per the doc: "clause1" [AND | OR] "clauseX", parentheses
+    // for precedence, AND/OR required to be uppercase and outside the quotes.
+    // Each clause is "property:text"; a bare quoted clause with no ":" isn't
+    // covered by an explicit example in the doc for directory objects
+    // specifically (unlike messages, which default to from/subject/body) -
+    // defaulting it to displayName is a reasonable stand-in, not a confirmed
+    // real behavior, since it's the one property every directory object type
+    // actually has.
+    private static SearchNode? TryParseSearch(string search)
+    {
+        var tokens = SearchTokenRegex.Matches(search).Select(m => m.Value).ToList();
+        if (tokens.Count == 0)
+        {
+            return null;
+        }
+
+        var pos = 0;
+        var node = ParseSearchOr(tokens, ref pos);
+        return node is not null && pos == tokens.Count ? node : null;
+    }
+
+    private static SearchNode? ParseSearchOr(List<string> tokens, ref int pos)
+    {
+        var left = ParseSearchAnd(tokens, ref pos);
+        while (left is not null && pos < tokens.Count && tokens[pos] == "OR")
+        {
+            pos++;
+            var right = ParseSearchAnd(tokens, ref pos);
+            left = right is null ? null : new SearchLogicalNode(left, right, IsAnd: false);
+        }
+
+        return left;
+    }
+
+    private static SearchNode? ParseSearchAnd(List<string> tokens, ref int pos)
+    {
+        var left = ParseSearchPrimary(tokens, ref pos);
+        while (left is not null && pos < tokens.Count && tokens[pos] == "AND")
+        {
+            pos++;
+            var right = ParseSearchPrimary(tokens, ref pos);
+            left = right is null ? null : new SearchLogicalNode(left, right, IsAnd: true);
+        }
+
+        return left;
+    }
+
+    private static SearchNode? ParseSearchPrimary(List<string> tokens, ref int pos)
+    {
+        if (pos >= tokens.Count)
+        {
+            return null;
+        }
+
+        if (tokens[pos] == "(")
+        {
+            pos++;
+            var inner = ParseSearchOr(tokens, ref pos);
+            if (inner is null || pos >= tokens.Count || tokens[pos] != ")")
+            {
+                return null;
+            }
+
+            pos++;
+            return inner;
+        }
+
+        var token = tokens[pos];
+        if (token.Length < 2 || token[0] != '"' || token[^1] != '"')
+        {
+            // Anything else here - most commonly a lowercase "and"/"or",
+            // which the doc requires to be uppercase - is malformed.
+            return null;
+        }
+
+        var unescaped = UnescapeSearchClause(token[1..^1]);
+        var colonIdx = unescaped.IndexOf(':', StringComparison.Ordinal);
+        var propName = colonIdx < 0 ? "displayName" : unescaped[..colonIdx];
+        var text = colonIdx < 0 ? unescaped : unescaped[(colonIdx + 1)..];
+
+        pos++;
+        return new SearchClauseNode(propName, text);
+    }
+
+    private static string UnescapeSearchClause(string raw)
+    {
+        var result = new System.Text.StringBuilder(raw.Length);
+        for (var i = 0; i < raw.Length; i++)
+        {
+            if (raw[i] == '\\' && i + 1 < raw.Length)
+            {
+                i++;
+            }
+
+            result.Append(raw[i]);
+        }
+
+        return result.ToString();
+    }
+
+    // Entity-set/singleton-level restrictions take precedence over the type-level
+    // default when both exist, same as real OData annotation target resolution
+    // (a more specific target wins) - see SchemaRegistry's field comments for why
+    // that split exists at all.
+    private static QueryRestrictions? GetRestrictions(SchemaRegistry registry, string? setOrSingletonName, string typeFullName)
+    {
+        if (setOrSingletonName is not null && registry.EntitySetRestrictions.TryGetValue(setOrSingletonName, out var setRestrictions))
+        {
+            return setRestrictions;
+        }
+
+        return registry.TypeRestrictions.TryGetValue(typeFullName, out var typeRestrictions) ? typeRestrictions : null;
+    }
 
     // --- CSDL parsing ---
 
@@ -1275,7 +2234,107 @@ public sealed class GraphSchemaMockPlugin(
             registry.Singletons[m.Groups[1].Value] = m.Groups[2].Value;
         }
 
+        // Needs EntitySets/Singletons already populated, to tell an entity-set-level
+        // annotation target apart from a type-level one - see ParseCapabilityRestrictions.
+        ParseCapabilityRestrictions(registry, csdl);
+
         return registry;
+    }
+
+    // Restriction annotations (Org.OData.Capabilities.V1.{Filter,Sort,Expand}Restrictions)
+    // sit in top-level <Annotations Target="..."> blocks, not nested inside the
+    // EntityType/EntitySet they describe - Target is either an entity type's full
+    // name (the dominant real-world pattern - confirmed: 73/73 FilterRestrictions,
+    // 96/101 ExpandRestrictions target a type this way) or "{container}/{entitySet
+    // or singleton name}" for a set-specific override (rarer, but where "users" own
+    // chats/joinedTeams/etc. exclusions actually live). Rather than reconstructing
+    // the exact container-qualified name to detect the latter, this just checks
+    // whether Target's last path segment matches an already-known entity set or
+    // singleton name - simpler, and just as reliable given Graph's naming never
+    // collides between the two.
+    private static void ParseCapabilityRestrictions(SchemaRegistry registry, string csdl)
+    {
+        foreach (Match ann in Regex.Matches(csdl, @"<Annotations Target=""([^""]+)"">(.*?)</Annotations>", RegexOptions.Singleline, TimeSpan.FromSeconds(30)))
+        {
+            var restrictions = ParseRestrictionsFromAnnotationsBody(ann.Groups[2].Value);
+            if (restrictions is null)
+            {
+                continue;
+            }
+
+            var targetRaw = ann.Groups[1].Value;
+            var slashIdx = targetRaw.LastIndexOf('/');
+            var possibleSetName = slashIdx >= 0 ? targetRaw[(slashIdx + 1)..] : null;
+            if (possibleSetName is not null &&
+                (registry.EntitySets.ContainsKey(possibleSetName) || registry.Singletons.ContainsKey(possibleSetName)))
+            {
+                registry.EntitySetRestrictions[possibleSetName] = restrictions;
+                continue;
+            }
+
+            var resolvedType = ResolveRefName(registry, targetRaw);
+            if (registry.Types.ContainsKey(resolvedType))
+            {
+                registry.TypeRestrictions[resolvedType] = restrictions;
+            }
+        }
+    }
+
+    private static QueryRestrictions? ParseRestrictionsFromAnnotationsBody(string body)
+    {
+        QueryRestrictions? restrictions = null;
+
+        var filterMatch = Regex.Match(body, @"<Annotation Term=""Org\.OData\.Capabilities\.V1\.FilterRestrictions""[^>]*>(.*?)</Annotation>", RegexOptions.Singleline, TimeSpan.FromSeconds(30));
+        if (filterMatch.Success)
+        {
+            // Provably the first assignment (restrictions is declared null right
+            // above, on every path) - a plain assignment here, not `??=`, since the
+            // analyzer flags the null-check as dead code otherwise (CA1508).
+            restrictions = new QueryRestrictions();
+            restrictions.Filterable = ParseBoolProperty(filterMatch.Groups[1].Value, "Filterable", defaultValue: true);
+            restrictions.NonFilterableProperties.UnionWith(ParsePropertyPathCollection(filterMatch.Groups[1].Value, "NonFilterableProperties", "PropertyPath"));
+        }
+
+        var sortMatch = Regex.Match(body, @"<Annotation Term=""Org\.OData\.Capabilities\.V1\.SortRestrictions""[^>]*>(.*?)</Annotation>", RegexOptions.Singleline, TimeSpan.FromSeconds(30));
+        if (sortMatch.Success)
+        {
+            restrictions ??= new QueryRestrictions();
+            restrictions.Sortable = ParseBoolProperty(sortMatch.Groups[1].Value, "Sortable", defaultValue: true);
+            restrictions.NonSortableProperties.UnionWith(ParsePropertyPathCollection(sortMatch.Groups[1].Value, "NonSortableProperties", "PropertyPath"));
+        }
+
+        var expandMatch = Regex.Match(body, @"<Annotation Term=""Org\.OData\.Capabilities\.V1\.ExpandRestrictions""[^>]*>(.*?)</Annotation>", RegexOptions.Singleline, TimeSpan.FromSeconds(30));
+        if (expandMatch.Success)
+        {
+            restrictions ??= new QueryRestrictions();
+            restrictions.Expandable = ParseBoolProperty(expandMatch.Groups[1].Value, "Expandable", defaultValue: true);
+            restrictions.NonExpandableProperties.UnionWith(ParsePropertyPathCollection(expandMatch.Groups[1].Value, "NonExpandableProperties", "NavigationPropertyPath"));
+        }
+
+        return restrictions;
+    }
+
+    private static bool ParseBoolProperty(string recordBody, string propertyName, bool defaultValue)
+    {
+        var m = Regex.Match(recordBody, $@"<PropertyValue Property=""{propertyName}""\s+Bool=""([^""]+)""", RegexOptions.None, TimeSpan.FromSeconds(5));
+        return m.Success ? string.Equals(m.Groups[1].Value, "true", StringComparison.OrdinalIgnoreCase) : defaultValue;
+    }
+
+    private static HashSet<string> ParsePropertyPathCollection(string recordBody, string propertyName, string pathElementTag)
+    {
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var collectionMatch = Regex.Match(recordBody, $@"<PropertyValue Property=""{propertyName}"">\s*<Collection>(.*?)</Collection>", RegexOptions.Singleline, TimeSpan.FromSeconds(5));
+        if (!collectionMatch.Success)
+        {
+            return result;
+        }
+
+        foreach (Match p in Regex.Matches(collectionMatch.Groups[1].Value, $@"<{pathElementTag}>([^<]+)</{pathElementTag}>"))
+        {
+            result.Add(p.Groups[1].Value);
+        }
+
+        return result;
     }
 
     private static void ParseTypeBlocks(SchemaRegistry registry, string namespaceName, string body, string tagName)

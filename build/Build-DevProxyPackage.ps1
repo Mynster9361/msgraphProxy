@@ -128,6 +128,45 @@ try {
 
     Set-Content -Path $proxyEngineFile -Value $proxyEngineContent -NoNewline
 
+    # GraphMockResponsePlugin (dev-proxy's own built-in mocks.json plugin,
+    # not ours) has a real asymmetry between its batch and non-batch
+    # request handling: for an ordinary request that matches nothing in
+    # mocks.json, it correctly does nothing and lets later plugins (like
+    # GraphSchemaMockPlugin) take over - confirmed directly in its source,
+    # this is the whole reason schema-based mocking has worked at all
+    # everywhere else this session. For a $batch request, though, it
+    # unconditionally claims the response regardless of whether ANY
+    # sub-request matched a real mocks.json entry, wrapping every
+    # unmatched sub-request in a synthetic 502 "No mock response found"
+    # placeholder - confirmed directly via a real request, where every
+    # $batch call came back entirely 502-filled even with mocks.json
+    # completely empty (this module's shipped default), never reaching
+    # GraphSchemaMockPlugin's own $batch support at all. The patch makes it
+    # fall through instead - exactly mirroring its own non-batch behavior -
+    # when literally none of the sub-requests matched anything, while still
+    # honoring real mocks.json entries when they exist (a batch with at
+    # least one genuine match is left completely alone).
+    Write-Verbose "Patching GraphMockResponsePlugin.cs so an empty mocks.json doesn't swallow every `$batch request before GraphSchemaMockPlugin gets a turn"
+    $mockResponsePluginFile = Join-Path -Path $cloneRoot -ChildPath 'DevProxy.Plugins\Mocking\GraphMockResponsePlugin.cs'
+    $mockResponsePluginContent = Get-Content -Path $mockResponsePluginFile -Raw
+
+    $batchFallthroughPattern = [regex]::new(
+        '(?<indent>[ \t]*)var batchRequestId\s*=\s*Guid\.NewGuid\(\)\.ToString\(\);\s*var batchRequestDate\s*=\s*DateTime\.Now\.ToString\("r",\s*CultureInfo\.InvariantCulture\);\s*var batchHeaders\s*=\s*ProxyUtils\.BuildGraphResponseHeaders\(e\.Session\.HttpClient\.Request,\s*batchRequestId,\s*batchRequestDate\);',
+        [System.Text.RegularExpressions.RegexOptions]::Singleline)
+    if (-not $batchFallthroughPattern.IsMatch($mockResponsePluginContent)) {
+        throw "Couldn't find the expected `$batch response-building code in GraphMockResponsePlugin.cs to patch - upstream dev-proxy may have changed this file. Aborting rather than silently shipping a package where an empty mocks.json breaks every `$batch request."
+    }
+
+    $batchFallthroughReplacement = "`${indent}if (responses.TrueForAll(r => r.Status == (int)HttpStatusCode.BadGateway))`n" +
+                                    "`${indent}{`n" +
+                                    "`${indent}    return;`n" +
+                                    "`${indent}}`n`n" +
+                                    "`${indent}var batchRequestId = Guid.NewGuid().ToString();`n" +
+                                    "`${indent}var batchRequestDate = DateTime.Now.ToString(`"r`", CultureInfo.InvariantCulture);`n" +
+                                    "`${indent}var batchHeaders = ProxyUtils.BuildGraphResponseHeaders(e.Session.HttpClient.Request, batchRequestId, batchRequestDate);"
+    $mockResponsePluginContent = $batchFallthroughPattern.Replace($mockResponsePluginContent, $batchFallthroughReplacement)
+    Set-Content -Path $mockResponsePluginFile -Value $mockResponsePluginContent -NoNewline
+
     foreach ($currentRid in $Rid) {
         Write-Verbose "Publishing devproxy for $currentRid"
         $publishDir = Join-Path -Path $cloneRoot -ChildPath "dist\$currentRid"

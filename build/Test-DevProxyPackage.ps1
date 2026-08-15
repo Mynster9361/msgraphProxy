@@ -162,14 +162,314 @@ try {
         if ($r.Headers['Content-Type'] -notlike 'text/plain*') { throw "expected text/plain, got $($r.Headers['Content-Type'])" }
     }
 
+    # /users/$count is a directory-object "advanced query" - real Graph
+    # requires ConsistencyLevel: eventual for it (see aad-advanced-queries),
+    # so unlike every other check here it needs its own headers.
+    $advancedQueryHeaders = @{ Authorization = 'Bearer faketoken'; ConsistencyLevel = 'eventual' }
+
     Test-Check 'GET /users/$count returns a bare integer' {
-        $r = Invoke-WebRequest -Uri 'https://graph.microsoft.com/v1.0/users/$count' -Headers $headers -SkipCertificateCheck -TimeoutSec 15
+        $r = Invoke-WebRequest -Uri 'https://graph.microsoft.com/v1.0/users/$count' -Headers $advancedQueryHeaders -SkipCertificateCheck -TimeoutSec 15
         if ($r.Content -notmatch '^\d+$') { throw "expected a bare integer, got '$($r.Content)'" }
     }
 
-    Test-Check '$filter narrows results' {
-        $r = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users?`$filter=givenName eq 'Jane'" -Headers $headers -SkipCertificateCheck -TimeoutSec 15
-        if ($r.value.Count -ne 1) { throw "expected 1 result, got $($r.value.Count)" }
+    Test-Check 'GET /users/$count without ConsistencyLevel is rejected (400)' {
+        try {
+            $r = Invoke-WebRequest -Uri 'https://graph.microsoft.com/v1.0/users/$count' -Headers $headers -SkipCertificateCheck -TimeoutSec 15
+            throw "expected 400, got $($r.StatusCode)"
+        } catch [Microsoft.PowerShell.Commands.HttpResponseException] {
+            if ($_.Exception.Response.StatusCode -ne 400) { throw "expected 400, got $($_.Exception.Response.StatusCode)" }
+        }
+    }
+
+    # One row per $filter method this plugin implements, run against both
+    # v1.0 and beta. Each row drives 4 checks: a malformed/unauthorized
+    # request that must be rejected (400), a well-formed one that must
+    # succeed (200), a well-formed one with criteria that legitimately
+    # matches nothing (200, 0 results), and one that legitimately matches
+    # (200, an exact expected count) - proving each operator both rejects
+    # what it should and correctly discriminates true from false, not just
+    # that it doesn't crash. RequiresAdvancedQuery methods (ne/not/endsWith)
+    # reuse that same shape: "malformed" becomes "missing ConsistencyLevel/
+    # $count=true", exactly the real rejection reason for those operators on
+    # a directory object (see https://learn.microsoft.com/graph/aad-advanced-queries).
+    #
+    # Values below are chosen against this plugin's own known seed data for
+    # microsoft.graph.user (shared identically between v1.0 and beta - the
+    # underlying pool is keyed by type, not API version): user 1 has
+    # givenName "Test", surname "User", mail/userPrincipalName
+    # "testuser@contoso.com", companyName "Contoso", jobTitle "Developer";
+    # user 2 (SecondSample) has givenName "Jane", surname "Doe", mail/
+    # userPrincipalName "jane.doe@contoso.com", same companyName and
+    # jobTitle as user 1.
+    $filterMethodTests = @(
+        @{ Name = 'eq'; RequiresAdvancedQuery = $false
+           Malformed = "givenName eq"
+           Valid     = "givenName eq 'Test'"
+           NoMatch   = "givenName eq 'Nobody'"
+           Match     = "givenName eq 'Jane'"; ExpectedCount = 1 }
+        @{ Name = 'ne'; RequiresAdvancedQuery = $true
+           Malformed = "jobTitle ne 'Manager'"
+           Valid     = "jobTitle ne 'Manager'"
+           NoMatch   = "companyName ne 'Contoso'"
+           Match     = "givenName ne 'Jane'"; ExpectedCount = 1 }
+        @{ Name = 'gt'; RequiresAdvancedQuery = $false
+           Malformed = "jobTitle gt"
+           Valid     = "officeLocation gt 'A'"
+           NoMatch   = "jobTitle gt 'ZZZZZZZZ'"
+           Match     = "jobTitle gt 'A'"; ExpectedCount = 2 }
+        @{ Name = 'lt'; RequiresAdvancedQuery = $false
+           Malformed = "jobTitle lt"
+           Valid     = "officeLocation lt 'zzzzzzzz'"
+           NoMatch   = "jobTitle lt 'A'"
+           Match     = "jobTitle lt 'zzzzzzzz'"; ExpectedCount = 2 }
+        @{ Name = 'ge'; RequiresAdvancedQuery = $false
+           Malformed = "jobTitle ge"
+           Valid     = "officeLocation ge 'A'"
+           NoMatch   = "jobTitle ge 'zzzzzzzz'"
+           Match     = "jobTitle ge 'Developer'"; ExpectedCount = 2 }
+        @{ Name = 'le'; RequiresAdvancedQuery = $false
+           Malformed = "jobTitle le"
+           Valid     = "officeLocation le 'zzzzzzzz'"
+           NoMatch   = "jobTitle le 'A'"
+           Match     = "jobTitle le 'Developer'"; ExpectedCount = 2 }
+        @{ Name = 'and'; RequiresAdvancedQuery = $false
+           Malformed = "givenName eq 'Jane' and"
+           Valid     = "givenName eq 'Jane' and surname eq 'Doe'"
+           NoMatch   = "givenName eq 'Jane' and surname eq 'User'"
+           Match     = "givenName eq 'Jane' and surname eq 'Doe'"; ExpectedCount = 1 }
+        @{ Name = 'or'; RequiresAdvancedQuery = $false
+           Malformed = "givenName eq 'Jane' or"
+           Valid     = "givenName eq 'Jane' or givenName eq 'Test'"
+           NoMatch   = "givenName eq 'Nobody' or givenName eq 'NoneEither'"
+           Match     = "givenName eq 'Jane' or givenName eq 'Test'"; ExpectedCount = 2 }
+        @{ Name = 'not'; RequiresAdvancedQuery = $true
+           Malformed = "not(jobTitle eq 'Manager')"
+           Valid     = "not(jobTitle eq 'Manager')"
+           NoMatch   = "not(companyName eq 'Contoso')"
+           Match     = "not(givenName eq 'Jane')"; ExpectedCount = 1 }
+        @{ Name = 'startswith'; RequiresAdvancedQuery = $false
+           Malformed = "startswith(givenName)"
+           Valid     = "startswith(mail,'test')"
+           NoMatch   = "startswith(givenName,'Zz')"
+           Match     = "startswith(givenName,'Ja')"; ExpectedCount = 1 }
+        @{ Name = 'contains'; RequiresAdvancedQuery = $false
+           Malformed = "contains(givenName)"
+           Valid     = "contains(mail,'contoso')"
+           NoMatch   = "contains(givenName,'xyz')"
+           Match     = "contains(mail,'jane')"; ExpectedCount = 1 }
+        @{ Name = 'endswith'; RequiresAdvancedQuery = $true
+           Malformed = "endswith(jobTitle,'er')"
+           Valid     = "endswith(jobTitle,'er')"
+           NoMatch   = "endswith(mail,'nobody.com')"
+           Match     = "endswith(mail,'contoso.com')"; ExpectedCount = 2 }
+        @{ Name = 'in'; RequiresAdvancedQuery = $false
+           Malformed = "givenName in ("
+           Valid     = "givenName in ('Jane','Test')"
+           NoMatch   = "givenName in ('Nobody','NoneEither')"
+           Match     = "givenName in ('Jane','Test')"; ExpectedCount = 2 }
+    )
+
+    foreach ($apiVersion in @('v1.0', 'beta')) {
+        foreach ($t in $filterMethodTests) {
+            $countSuffix = if ($t.RequiresAdvancedQuery) { '&$count=true' } else { '' }
+            $wellFormedHeaders = if ($t.RequiresAdvancedQuery) { $advancedQueryHeaders } else { $headers }
+
+            Test-Check "[$apiVersion] `$filter $($t.Name): malformed/unauthorized is rejected (400)" {
+                $uri = "https://graph.microsoft.com/$apiVersion/users?`$filter=$([Uri]::EscapeDataString($t.Malformed))"
+                try {
+                    $r = Invoke-WebRequest -Uri $uri -Headers $headers -SkipCertificateCheck -TimeoutSec 15
+                    throw "expected 400, got $($r.StatusCode)"
+                } catch [Microsoft.PowerShell.Commands.HttpResponseException] {
+                    if ($_.Exception.Response.StatusCode -ne 400) { throw "expected 400, got $($_.Exception.Response.StatusCode)" }
+                }
+            }
+
+            Test-Check "[$apiVersion] `$filter $($t.Name): well-formed succeeds (200)" {
+                $uri = "https://graph.microsoft.com/$apiVersion/users?`$filter=$([Uri]::EscapeDataString($t.Valid))$countSuffix"
+                $r = Invoke-RestMethod -Uri $uri -Headers $wellFormedHeaders -SkipCertificateCheck -TimeoutSec 15
+                if ($null -eq $r.value) { throw 'expected a value array in the response' }
+            }
+
+            Test-Check "[$apiVersion] `$filter $($t.Name): no-match returns 0 results" {
+                $uri = "https://graph.microsoft.com/$apiVersion/users?`$filter=$([Uri]::EscapeDataString($t.NoMatch))$countSuffix"
+                $r = Invoke-RestMethod -Uri $uri -Headers $wellFormedHeaders -SkipCertificateCheck -TimeoutSec 15
+                if ($r.value.Count -ne 0) { throw "expected 0 results, got $($r.value.Count)" }
+            }
+
+            Test-Check "[$apiVersion] `$filter $($t.Name): match returns $($t.ExpectedCount) result(s)" {
+                $uri = "https://graph.microsoft.com/$apiVersion/users?`$filter=$([Uri]::EscapeDataString($t.Match))$countSuffix"
+                $r = Invoke-RestMethod -Uri $uri -Headers $wellFormedHeaders -SkipCertificateCheck -TimeoutSec 15
+                if ($r.value.Count -ne $t.ExpectedCount) { throw "expected $($t.ExpectedCount) result(s), got $($r.value.Count)" }
+            }
+        }
+    }
+
+    # $search doesn't decompose into per-operator methods the way $filter
+    # does - it's always gated on directory objects (ConsistencyLevel only,
+    # no $count=true needed - the one documented exception to the general
+    # advanced-query rule), so every row's "Malformed" case is the missing-
+    # header rejection. Same seed data as the $filter table above.
+    $searchScenarioTests = @(
+        @{ Name = 'clause (tokenized displayName match)'
+           Malformed = '"displayName:Jane"'
+           Valid     = '"displayName:Jane"'
+           NoMatch   = '"displayName:Nobody"'
+           Match     = '"displayName:Jane"'; ExpectedCount = 1 }
+        @{ Name = 'clause (token order-independence)'
+           Malformed = '"displayName:Doe Jane"'
+           Valid     = '"displayName:Doe Jane"'
+           NoMatch   = '"displayName:Nobody Whoever"'
+           Match     = '"displayName:Doe Jane"'; ExpectedCount = 1 }
+        @{ Name = 'AND'
+           Malformed = '"displayName:Jane" AND "surname:Doe"'
+           Valid     = '"displayName:Jane" AND "surname:Doe"'
+           NoMatch   = '"displayName:Jane" AND "displayName:User"'
+           Match     = '"displayName:Jane" AND "surname:Doe"'; ExpectedCount = 1 }
+        @{ Name = 'OR'
+           Malformed = '"displayName:Jane" OR "displayName:Test"'
+           Valid     = '"displayName:Jane" OR "displayName:Test"'
+           NoMatch   = '"displayName:Nobody" OR "displayName:NoneEither"'
+           Match     = '"displayName:Jane" OR "displayName:Test"'; ExpectedCount = 1 }
+        @{ Name = 'non-displayName property falls back to startswith'
+           Malformed = '"mail:jane"'
+           Valid     = '"mail:jane"'
+           NoMatch   = '"mail:zzz"'
+           Match     = '"mail:jane"'; ExpectedCount = 1 }
+    )
+
+    foreach ($apiVersion in @('v1.0', 'beta')) {
+        foreach ($t in $searchScenarioTests) {
+            Test-Check "[$apiVersion] `$search $($t.Name): missing ConsistencyLevel is rejected (400)" {
+                $uri = "https://graph.microsoft.com/$apiVersion/users?`$search=$([Uri]::EscapeDataString($t.Malformed))"
+                try {
+                    $r = Invoke-WebRequest -Uri $uri -Headers $headers -SkipCertificateCheck -TimeoutSec 15
+                    throw "expected 400, got $($r.StatusCode)"
+                } catch [Microsoft.PowerShell.Commands.HttpResponseException] {
+                    if ($_.Exception.Response.StatusCode -ne 400) { throw "expected 400, got $($_.Exception.Response.StatusCode)" }
+                }
+            }
+
+            Test-Check "[$apiVersion] `$search $($t.Name): well-formed succeeds (200)" {
+                $uri = "https://graph.microsoft.com/$apiVersion/users?`$search=$([Uri]::EscapeDataString($t.Valid))"
+                $r = Invoke-RestMethod -Uri $uri -Headers $advancedQueryHeaders -SkipCertificateCheck -TimeoutSec 15
+                if ($null -eq $r.value) { throw 'expected a value array in the response' }
+            }
+
+            Test-Check "[$apiVersion] `$search $($t.Name): no-match returns 0 results" {
+                $uri = "https://graph.microsoft.com/$apiVersion/users?`$search=$([Uri]::EscapeDataString($t.NoMatch))"
+                $r = Invoke-RestMethod -Uri $uri -Headers $advancedQueryHeaders -SkipCertificateCheck -TimeoutSec 15
+                if ($r.value.Count -ne 0) { throw "expected 0 results, got $($r.value.Count)" }
+            }
+
+            Test-Check "[$apiVersion] `$search $($t.Name): match returns $($t.ExpectedCount) result(s)" {
+                $uri = "https://graph.microsoft.com/$apiVersion/users?`$search=$([Uri]::EscapeDataString($t.Match))"
+                $r = Invoke-RestMethod -Uri $uri -Headers $advancedQueryHeaders -SkipCertificateCheck -TimeoutSec 15
+                if ($r.value.Count -ne $t.ExpectedCount) { throw "expected $($t.ExpectedCount) result(s), got $($r.value.Count)" }
+            }
+        }
+
+        # Distinct from the table above: these are rejected for bad grammar,
+        # not a missing header - ConsistencyLevel IS present on both, so a
+        # 400 here can only be the parser correctly refusing the input.
+        Test-Check "[$apiVersion] `$search: lowercase 'and' is rejected (400)" {
+            $uri = "https://graph.microsoft.com/$apiVersion/users?`$search=$([Uri]::EscapeDataString('"displayName:Jane" and "surname:Doe"'))"
+            try {
+                $r = Invoke-WebRequest -Uri $uri -Headers $advancedQueryHeaders -SkipCertificateCheck -TimeoutSec 15
+                throw "expected 400, got $($r.StatusCode)"
+            } catch [Microsoft.PowerShell.Commands.HttpResponseException] {
+                if ($_.Exception.Response.StatusCode -ne 400) { throw "expected 400, got $($_.Exception.Response.StatusCode)" }
+            }
+        }
+
+        Test-Check "[$apiVersion] `$search: unterminated clause is rejected (400)" {
+            $uri = "https://graph.microsoft.com/$apiVersion/users?`$search=$([Uri]::EscapeDataString('"displayName:Jane'))"
+            try {
+                $r = Invoke-WebRequest -Uri $uri -Headers $advancedQueryHeaders -SkipCertificateCheck -TimeoutSec 15
+                throw "expected 400, got $($r.StatusCode)"
+            } catch [Microsoft.PowerShell.Commands.HttpResponseException] {
+                if ($_.Exception.Response.StatusCode -ne 400) { throw "expected 400, got $($_.Exception.Response.StatusCode)" }
+            }
+        }
+    }
+
+    # https://learn.microsoft.com/graph/json-batching. GraphMockResponsePlugin
+    # (dev-proxy's own built-in mocks.json plugin, not ours) used to swallow
+    # every $batch request outright whenever mocks.json had no matching
+    # entries - unlike its own non-batch behavior, which correctly falls
+    # through - so these checks also stand as a regression test for that
+    # source patch in Build-DevProxyPackage.ps1, not just for
+    # GraphSchemaMockPlugin's own $batch support.
+    Test-Check '$batch: unrelated sub-requests each resolve independently' {
+        $body = @{
+            requests = @(
+                @{ id = '1'; method = 'GET'; url = '/users' }
+                @{ id = '2'; method = 'GET'; url = "/users/$userId" }
+                @{ id = '3'; method = 'POST'; url = "/groups/22222222-2222-2222-2222-222222222222/members/`$ref"; body = @{ '@odata.id' = 'https://graph.microsoft.com/v1.0/directoryObjects/11111111-1111-1111-1111-111111111111' }; headers = @{ 'Content-Type' = 'application/json' } }
+            )
+        } | ConvertTo-Json -Depth 10
+        $r = Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/$batch' -Method POST -Headers $headers -Body $body -ContentType 'application/json' -SkipCertificateCheck -TimeoutSec 15
+        $byId = @{}
+        foreach ($resp in $r.responses) { $byId[$resp.id] = $resp.status }
+        if ($byId['1'] -ne 200) { throw "expected id 1 status 200, got $($byId['1'])" }
+        if ($byId['2'] -ne 200) { throw "expected id 2 status 200, got $($byId['2'])" }
+        if ($byId['3'] -ne 204) { throw "expected id 3 status 204, got $($byId['3'])" }
+    }
+
+    Test-Check '$batch: dependsOn sequencing (doc''s own 1->2->4->3 example)' {
+        $body = @{
+            requests = @(
+                @{ id = '1'; method = 'GET'; url = '/users' }
+                @{ id = '2'; dependsOn = @('1'); method = 'GET'; url = '/users' }
+                @{ id = '4'; dependsOn = @('2'); method = 'GET'; url = '/users' }
+                @{ id = '3'; dependsOn = @('4'); method = 'GET'; url = '/users' }
+            )
+        } | ConvertTo-Json -Depth 10
+        $r = Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/$batch' -Method POST -Headers $headers -Body $body -ContentType 'application/json' -SkipCertificateCheck -TimeoutSec 15
+        if (($r.responses | Where-Object { $_.status -ne 200 }).Count -ne 0) { throw "expected all 4 sub-responses to be 200, got: $($r.responses | ConvertTo-Json -Compress)" }
+    }
+
+    Test-Check '$batch: a failed dependency propagates 424 to its dependent' {
+        $body = @{
+            requests = @(
+                @{ id = '1'; method = 'GET'; url = "/users?`$filter=givenName eq" }
+                @{ id = '2'; dependsOn = @('1'); method = 'GET'; url = '/users' }
+            )
+        } | ConvertTo-Json -Depth 10
+        $r = Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/$batch' -Method POST -Headers $headers -Body $body -ContentType 'application/json' -SkipCertificateCheck -TimeoutSec 15
+        $byId = @{}
+        foreach ($resp in $r.responses) { $byId[$resp.id] = $resp.status }
+        if ($byId['1'] -ne 400) { throw "expected id 1 (malformed `$filter) status 400, got $($byId['1'])" }
+        if ($byId['2'] -ne 424) { throw "expected id 2 (depends on failed id 1) status 424, got $($byId['2'])" }
+    }
+
+    Test-Check '$batch: per-sub-request headers are independent (ConsistencyLevel on one, not the other)' {
+        $body = @{
+            requests = @(
+                @{ id = '1'; method = 'GET'; url = "users?`$filter=givenName ne 'Jane'&`$count=true"; headers = @{ ConsistencyLevel = 'eventual' } }
+                @{ id = '2'; method = 'GET'; url = "users?`$filter=givenName ne 'Jane'" }
+            )
+        } | ConvertTo-Json -Depth 10
+        $r = Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/$batch' -Method POST -Headers $headers -Body $body -ContentType 'application/json' -SkipCertificateCheck -TimeoutSec 15
+        $byId = @{}
+        foreach ($resp in $r.responses) { $byId[$resp.id] = $resp.status }
+        if ($byId['1'] -ne 200) { throw "expected id 1 (has ConsistencyLevel) status 200, got $($byId['1'])" }
+        if ($byId['2'] -ne 400) { throw "expected id 2 (missing ConsistencyLevel) status 400, got $($byId['2'])" }
+    }
+
+    Test-Check '$batch: duplicate request id is rejected (400)' {
+        $body = @{ requests = @(@{ id = '1'; method = 'GET'; url = '/users' }, @{ id = '1'; method = 'GET'; url = '/users' }) } | ConvertTo-Json -Depth 10
+        try {
+            $r = Invoke-WebRequest -Uri 'https://graph.microsoft.com/v1.0/$batch' -Method POST -Headers $headers -Body $body -ContentType 'application/json' -SkipCertificateCheck -TimeoutSec 15
+            throw "expected 400, got $($r.StatusCode)"
+        } catch [Microsoft.PowerShell.Commands.HttpResponseException] {
+            if ($_.Exception.Response.StatusCode -ne 400) { throw "expected 400, got $($_.Exception.Response.StatusCode)" }
+        }
+    }
+
+    Test-Check '$batch: an unresolvable sub-request path gets its own 404, outer batch stays 200' {
+        $body = @{ requests = @(@{ id = '1'; method = 'GET'; url = '/totally/not/a/real/graph/path' }) } | ConvertTo-Json -Depth 10
+        $r = Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/$batch' -Method POST -Headers $headers -Body $body -ContentType 'application/json' -SkipCertificateCheck -TimeoutSec 15
+        if ($r.responses[0].status -ne 404) { throw "expected 404, got $($r.responses[0].status)" }
     }
 
     Test-Check '$expand surfaces a navigation property' {
