@@ -1,0 +1,78 @@
+name: test-psmodules against psmoduls
+
+on:
+    workflow_dispatch:
+    push:
+        branches: ["main"]
+
+permissions:
+    contents: read
+
+jobs:
+    run-maester-against-mock:
+        name: Run Maester against the mock
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v7
+
+            - name: Start msgraphProxy in CI mode
+              shell: pwsh
+              run: |
+                  # A real consumer would instead run:
+                  #   Install-Module msgraphProxy -Scope CurrentUser -Force
+                  Import-Module ./msgraphProxy/msgraphProxy.psd1 -Force
+                  Install-MsGraphProxy
+                  $result = Start-MsGraphProxy -CI -Confirm:$false
+                  Write-Host "CertificateTrusted: $($result.CertificateTrusted)"
+
+            - name: Raw API
+              shell: pwsh
+              run: |
+                  $tenantId = "123"
+                  $clientId = "123"
+                  $clientSecret = "123"
+
+                  $tokenBody = @{
+                      Grant_Type    = "client_credentials"
+                      Scope         = "https://graph.microsoft.com/.default"
+                      Client_Id     = $clientId
+                      Client_Secret = $clientSecret
+                  }
+
+                  $tokenResponse = Invoke-RestMethod -Uri "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token" -Method POST -Body $tokenBody
+                  $tokenResponse
+
+                  $headers = @{
+                      Authorization = "Bearer $($tokenResponse.access_token)"
+                  }
+
+                  Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/users' -Headers $headers
+
+            - name: EntraAuth
+              shell: pwsh
+              run: |
+                  Install-Module -Name EntraAuth
+                  $clientID = '123'
+                  $tenantID = '123'
+                  $secret = '123' | ConvertTo-SecureString -AsPlainText -Force
+
+                  Connect-EntraService -ClientID $clientID -TenantID $tenantID -ClientSecret $secret
+
+                  Invoke-EntraRequest -Path users
+
+            - name: Microsoft.Graph
+              shell: pwsh
+              run: |
+                  # install modules
+                  Install-Module -Name Microsoft.Graph.Authentication
+                  Install-Module -Name Microsoft.Graph.Users
+
+                  $clientID = '123'
+                  $secret = '123'
+                  $tenantID = '123'
+                  $credential = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $clientID, (ConvertTo-SecureString -String $secret -AsPlainText -Force)
+
+                  Connect-MgGraph -TenantId $tenantId -ClientSecretCredential $credentia
+
+                  Get-MgUser
