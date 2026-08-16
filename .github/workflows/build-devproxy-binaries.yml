@@ -113,4 +113,4 @@ jobs:
                   # release anyway - neither of which Install-MsGraphProxy (which
                   # reads /releases/latest) should ever have to see.
                   $tag = "devproxy-$(Get-Date -Format yyyyMMdd-HHmmss)"
-                  gh release create $tag .\package\*.zip --title $tag --notes "Automated Dev Proxy build with the msgraphProxy plugins (GraphSchemaMockPlugin, EntraTokenMockPlugin)."
+                  gh release create $tag .\package\*.zip --title $tag --notes "Automated Dev Proxy build with the msgraphProxy plugins (GraphSchemaMockPlugin, EntraTokenMockPlugin)." --prerelease
