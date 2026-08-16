@@ -1,4 +1,4 @@
-function Wait-MsGraphProxyPort {
+﻿function Wait-MsGraphProxyPort {
 	<#
 	.SYNOPSIS
 		Waits for Dev Proxy's actual proxy port to start accepting connections.
