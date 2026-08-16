@@ -1,4 +1,4 @@
-name: test-psmodules against psmoduls
+﻿name: test-psmodules against psmoduls
 
 on:
     workflow_dispatch:
@@ -9,8 +9,8 @@ permissions:
     contents: read
 
 jobs:
-    run-maester-against-mock:
-        name: Run Maester against the mock
+    run-api-against-mock:
+        name: Run api against the mock
         runs-on: ubuntu-latest
 
         steps:
@@ -47,32 +47,68 @@ jobs:
                       Authorization = "Bearer $($tokenResponse.access_token)"
                   }
 
-                  Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/users' -Headers $headers
+                  $response = Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/users' -Headers $headers
+                  $response
+
+                  $rows = $response.value | ForEach-Object { "| $($_.displayName) | $($_.userPrincipalName) |" }
+                  Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @"
+                  ## Raw API
+
+                  Retrieved $($response.value.Count) user(s) via a plain ``Invoke-RestMethod`` call.
+
+                  | Display name | UPN |
+                  | --- | --- |
+                  $($rows -join "`n")
+                  "@
 
             - name: EntraAuth
               shell: pwsh
               run: |
-                  Install-Module -Name EntraAuth
+                  Install-Module -Name EntraAuth -Scope CurrentUser -Force
                   $clientID = '123'
                   $tenantID = '123'
                   $secret = '123' | ConvertTo-SecureString -AsPlainText -Force
 
                   Connect-EntraService -ClientID $clientID -TenantID $tenantID -ClientSecret $secret
 
-                  Invoke-EntraRequest -Path users
+                  $users = Invoke-EntraRequest -Path users
+                  $users
+
+                  $rows = $users | ForEach-Object { "| $($_.displayName) | $($_.userPrincipalName) |" }
+                  Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @"
+                  ## EntraAuth
+
+                  Retrieved $($users.Count) user(s) via ``Invoke-EntraRequest``.
+
+                  | Display name | UPN |
+                  | --- | --- |
+                  $($rows -join "`n")
+                  "@
 
             - name: Microsoft.Graph
               shell: pwsh
               run: |
                   # install modules
-                  Install-Module -Name Microsoft.Graph.Authentication
-                  Install-Module -Name Microsoft.Graph.Users
+                  Install-Module -Name Microsoft.Graph.Authentication -Scope CurrentUser -Force
+                  Install-Module -Name Microsoft.Graph.Users -Scope CurrentUser -Force
 
                   $clientID = '123'
                   $secret = '123'
                   $tenantID = '123'
                   $credential = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $clientID, (ConvertTo-SecureString -String $secret -AsPlainText -Force)
 
-                  Connect-MgGraph -TenantId $tenantId -ClientSecretCredential $credentia
+                  Connect-MgGraph -TenantId $tenantId -ClientSecretCredential $credential -NoWelcome
 
-                  Get-MgUser
+                  $mgUsers = Get-MgUser
+                  $mgUsers
+
+                  $rows = $mgUsers | ForEach-Object { "| $($_.DisplayName) | $($_.UserPrincipalName) |" }
+                  Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @"
+                  ## Microsoft.Graph
+
+                  Retrieved $($mgUsers.Count) user(s) via ``Get-MgUser``.
+
+                  | Display name | UPN |
+                  | --- | --- |
+                  $($rows -join "`n")
+                  "@
