@@ -131,6 +131,11 @@
 		$derivedConfig = New-MsGraphProxyCIConfigFile -ConfigFile $resolvedConfigFile -CI:$CI -SubscribedSkus $licensePreset
 		$resolvedConfigFile = $derivedConfig.ConfigFile
 		$proxyPort = $derivedConfig.ProxyPort
+	} else {
+		$rawConfig = Get-Content -Raw -Path $resolvedConfigFile | ConvertFrom-Json -AsHashtable
+		if ($rawConfig.ContainsKey('port')) {
+			$proxyPort = [int]$rawConfig['port']
+		}
 	}
 
 	$processArgs = @('--config-file', "`"$resolvedConfigFile`"", '--api-port', $ApiPort)
@@ -163,6 +168,15 @@
 	Write-Verbose "Dev Proxy started (PID $($process.Id)) using $resolvedConfigFile"
 
 	$result = Get-MsGraphProxyStatus
+	$ready = Wait-MsGraphProxyControlApi -ApiPort $ApiPort
+	if ($ready) {
+		$ready = Wait-MsGraphProxyPort -ProxyPort $proxyPort
+	}
+
+	if (-not $ready) {
+		Write-Warning 'Dev Proxy did not become ready to serve requests in time.'
+	}
+
 	if ($CI) {
 		$proxyUri = "http://127.0.0.1:$proxyPort"
 		foreach ($name in 'HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy') {
@@ -178,10 +192,10 @@
 		[System.Net.Http.HttpClient]::DefaultProxy = [System.Net.WebProxy]::new($proxyUri)
 
 		$certificateTrusted = $false
-		if (Wait-MsGraphProxyControlApi -ApiPort $ApiPort) {
+		if ($ready) {
 			$certificateTrusted = Install-MsGraphProxyCertificate -ApiPort $ApiPort
 		} else {
-			Write-Warning 'Dev Proxy did not become ready in time; skipping automatic certificate trust.'
+			Write-Warning 'Skipping automatic certificate trust since Dev Proxy never became ready.'
 		}
 
 		$result = $result | Add-Member -NotePropertyName CertificateTrusted -NotePropertyValue $certificateTrusted -PassThru
