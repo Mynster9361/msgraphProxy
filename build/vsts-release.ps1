@@ -38,6 +38,55 @@ Compress-Archive -Path "$WorkingDirectory\publish\msgraphProxy\*" -DestinationPa
 # them, not just the module content. build-devproxy-binaries.yml publishes
 # its own builds as prereleases (tagged devproxy-*) specifically so they
 # never compete for "latest" and can just be pulled in here instead.
+#
+# Race condition, confirmed happening for real: build-devproxy-binaries.yml
+# (path-filtered on build/plugins-src/**, build/Build-DevProxyPackage.ps1,
+# build/Test-DevProxyPackage.ps1) triggers on the SAME push as this workflow,
+# but as an independently-scheduled run - nothing orders them relative to
+# each other. A plugins-src fix got bundled into the very next module
+# release using the *previous* devproxy-* prerelease, because this script
+# reached this step while build-devproxy-binaries.yml was still mid-build
+# (cloning dev-proxy, publishing 3 RIDs) for the same commit; the fix itself
+# published fine 3 minutes later, but nothing ever re-bundled it into a
+# release /releases/latest would actually serve - Install-MsGraphProxy never
+# saw it. So: if a build-devproxy-binaries.yml run exists for this exact
+# commit, wait for it to finish (and fail loudly if it failed) before
+# grabbing "most recent" - otherwise "most recent" can silently mean "most
+# recent before this commit's own fix". If no such run shows up within the
+# initial window, this commit didn't touch anything path-filtered in, so
+# there's nothing to wait for.
+$headSha = $env:GITHUB_SHA
+if ($headSha) {
+	Write-Host "Checking for a build-devproxy-binaries.yml run against $headSha"
+	$deadline = (Get-Date).AddMinutes(20)
+	$matchingRun = $null
+	do {
+		$runs = gh run list --repo Mynster9361/msgraphProxy --workflow build-devproxy-binaries.yml --json headSha, status, conclusion --limit 20 | ConvertFrom-Json
+		$matchingRun = $runs | Where-Object headSha -eq $headSha | Select-Object -First 1
+
+		if ($matchingRun -and $matchingRun.status -eq 'completed') {
+			break
+		}
+
+		if ($matchingRun) {
+			Write-Host "build-devproxy-binaries.yml is still running for this commit ($($matchingRun.status)) - waiting..."
+		} else {
+			Write-Host "No build-devproxy-binaries.yml run seen yet for this commit - waiting briefly in case one is about to start..."
+		}
+		Start-Sleep -Seconds 15
+	} while ((Get-Date) -lt $deadline)
+
+	if ($matchingRun -and $matchingRun.status -ne 'completed') {
+		throw "Timed out waiting for build-devproxy-binaries.yml to finish for $headSha - refusing to bundle a devproxy-* build that might not include this commit's changes."
+	}
+	if ($matchingRun -and $matchingRun.conclusion -ne 'success') {
+		throw "build-devproxy-binaries.yml for $headSha finished with conclusion '$($matchingRun.conclusion)' - refusing to bundle stale or failed Dev Proxy binaries."
+	}
+	if (-not $matchingRun) {
+		Write-Host "No build-devproxy-binaries.yml run found for this commit - proceeding with the most recent existing devproxy-* release."
+	}
+}
+
 Write-Host "Downloading the most recent Dev Proxy binaries build"
 $devProxyReleaseTag = gh release list --repo Mynster9361/msgraphProxy --limit 20 --json tagName,isDraft --jq '[.[] | select(.isDraft == false) | select(.tagName | startswith("devproxy-"))][0].tagName'
 if (-not $devProxyReleaseTag) {
