@@ -98,4 +98,22 @@ jobs:
               shell: pwsh
               run: |
                   Import-Module ./msgraphProxy/msgraphProxy.psd1 -Force
-                  Stop-MsGraphProxy -Confirm:$false
+                  $r = Stop-MsGraphProxy -Confirm:$false
+                  $r
+
+                  $perm = $r.Recording.GraphMinimalPermissionsPlugin
+                  $requestRows = $perm.requests | ForEach-Object { "| $($_.method) | $($_.requestUrl) |" }
+                  $permissionList = if ($perm.minimalPermissions) { $perm.minimalPermissions -join ', ' } else { '_none_' }
+
+                  Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @"
+                  ## Recording (minimal permissions)
+
+                  Permissions type: **$($perm.permissionsType)**
+                  Minimal permissions: $permissionList
+
+                  ### Requests made
+
+                  | Method | Request URL |
+                  | --- | --- |
+                  $($requestRows -join "`n")
+                  "@
