@@ -799,6 +799,26 @@ public sealed class GraphSchemaMockPlugin(
         var pool = GetOrSeedPool(registry, typeFullName);
         var existing = FindById(pool, itemId);
 
+        // unifiedRoleManagementAlert is unlike every other by-id entity here: its
+        // ids aren't arbitrary keys of user-created resources, they're a small,
+        // fixed set of well-known composite ids ("DirectoryRole_{tenantId}_{alertId}")
+        // that Microsoft Graph always resolves for any real tenant, active or not -
+        // confirmed directly against Maester's Test-MtPimAlertsExists, which GETs
+        // exactly this id shape and, on a real tenant, always gets a 200 back (an
+        // inactive alert, not a 404) even when nothing has ever triggered it. The
+        // generic "404 unless it's already in the seeded pool" model below is right
+        // for actual resource collections (users, groups, ...) but wrong here, so
+        // this type materializes an inactive alert on first request instead of
+        // 404ing - matching real Graph's behavior for a clean tenant, and letting
+        // Maester's PIM alert checks (MT.1029-MT.1032) evaluate instead of erroring.
+        if (existing is null && string.Equals(typeFullName, "microsoft.graph.unifiedRoleManagementAlert", StringComparison.Ordinal))
+        {
+            existing = BuildEntity(registry, typeFullName);
+            existing["id"] = itemId;
+            existing["isActive"] = false;
+            pool.Add(existing);
+        }
+
         if (existing is null)
         {
             return (ODataError("Request_ResourceNotFound", $"Resource '{itemId}' does not exist or one of its queried reference-property objects are not present."), HttpStatusCode.NotFound);
@@ -1424,23 +1444,31 @@ public sealed class GraphSchemaMockPlugin(
             return [.. SubscribedSkuDefaultProperties];
         }
 
-        var scalarNames = GetAllProperties(registry, fullName)
-            .Where(p => IsPrimitiveOrCollectionOfPrimitive(p.Type))
+        // GetAllProperties never includes navigation properties (those live in a
+        // separate NavigationProperties list per TypeDef) - real Graph's own
+        // default-response behavior (no $select) is "every direct property,
+        // whatever its kind, minus expanded navigation properties", not
+        // "primitives only". An earlier version of this filtered out anything
+        // whose EDM type wasn't Edm.* (dropping complex- and enum-typed
+        // properties), which is why conditionalAccessPolicy - real properties
+        // are almost entirely complex-typed (conditions, grantControls,
+        // sessionControls) or enum-typed (state) - came back as just
+        // id/description/displayName/created-/modifiedDateTime with nothing a
+        // caller could actually act on (confirmed directly: this is what made
+        // Maester's Test-MtCaMisconfiguredIDProtection/Test-MtCaAzureDevOps
+        // throw instead of evaluate, since `$policy.conditions` and `.state`
+        // were always absent). The subscribedSku special case above exists for
+        // the same underlying reason (its real default list needs 11 properties,
+        // over the Take(10) cap below) and stays for that reason even though
+        // this fix covers its complex-property-dropping half too.
+        var otherNames = GetAllProperties(registry, fullName)
             .Select(p => p.Name)
             .Where(n => !string.Equals(n, "id", StringComparison.Ordinal))
             .ToList();
 
         var result = new List<string> { "id" };
-        result.AddRange(scalarNames.Take(10));
+        result.AddRange(otherNames.Take(10));
         return result;
-    }
-
-    private static bool IsPrimitiveOrCollectionOfPrimitive(string type)
-    {
-        var inner = type.StartsWith("Collection(", StringComparison.Ordinal) && type.EndsWith(')')
-            ? type[11..^1]
-            : type;
-        return inner.StartsWith("Edm.", StringComparison.Ordinal);
     }
 
     private static JsonObject TrimTo(JsonObject source, IEnumerable<string> propNames)
