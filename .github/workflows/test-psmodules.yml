@@ -124,6 +124,7 @@ jobs:
                   $perm = $r.Recording.GraphMinimalPermissionsPlugin
                   $requestRows = $perm.requests | ForEach-Object { "| $($_.method) | $($_.requestUrl) |" }
                   $permissionList = if ($perm.minimalPermissions) { $perm.minimalPermissions -join ', ' } else { '_none_' }
+                  $errorRows = if ($perm.errors) { $perm.errors } else { @('_none_') }
 
                   Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @"
                   ## Recording (minimal permissions)
@@ -136,4 +137,8 @@ jobs:
                   | Method | Request URL |
                   | --- | --- |
                   $($requestRows -join "`n")
+
+                  ### Errors
+
+                  $($errorRows -join "`n")
                   "@
