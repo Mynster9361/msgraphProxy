@@ -17,8 +17,8 @@ back - useful for testing, demos, and CI pipelines that shouldn't need a real Mi
 >
 > The two mock plugins (`build/plugins-src/EntraTokenMockPlugin.cs`, `build/plugins-src/GraphSchemaMockPlugin.cs`)
 > and the `.github/workflows/build-devproxy-binaries.yml` pipeline were heavily AI-assisted, guided and tested
-> throughout by the module author. The rest of the PowerShell was written with a mix of both. All the research and
-> domain knowledge needed to design the module in the first place is the author's own.
+> throughout by me. The rest of the PowerShell was written with a mix of both. All the research and
+> domain knowledge needed to design the module in the first place is the me.
 
 ## Quick start
 
