@@ -20,6 +20,15 @@
 		Entra ID token endpoint, by default), tunnelling everything else
 		through untouched.
 
+		Dev Proxy still registers itself as the system-wide HTTP/HTTPS proxy
+		regardless of -WatchProcessName/-WatchPid - every proxy-aware app on
+		the machine keeps routing through it. What those two parameters
+		change is which processes' traffic Dev Proxy actually decrypts and
+		mocks; everything from an unmatched process passes through
+		untouched, same as an unmatched host would. Pass -WatchPid $PID to
+		scope interception to just the calling session, without touching
+		other pwsh windows or apps running at the same time.
+
 	.PARAMETER ConfigFile
 		Path to a devproxyrc.json/.yaml configuration file. Defaults to the
 		configuration bundled with this module.
@@ -52,6 +61,20 @@
 		out of the box. Pass -EntraIDLicense explicitly to pick a different
 		tier.
 
+	.PARAMETER WatchProcessName
+		Only intercept traffic from processes with one of these names (e.g.
+		'pwsh', 'msedge') - anything else passes through untouched. Dev Proxy
+		still registers system-wide either way; see the description above
+		for what this does and doesn't scope. Maps to Dev Proxy's own
+		--watch-process-names.
+
+	.PARAMETER WatchPid
+		Only intercept traffic from processes with one of these process IDs -
+		anything else passes through untouched. More precise than
+		-WatchProcessName when you only want to scope to one specific
+		process (e.g. -WatchPid $PID for the calling session) rather than
+		every process sharing its name. Maps to Dev Proxy's own --watch-pids.
+
 	.PARAMETER WhatIf
 		If this switch is enabled, no actions are performed but informational
 		messages will be displayed that explain what would happen if the command
@@ -78,6 +101,13 @@
 		block startup, HTTP_PROXY/HTTPS_PROXY set for the current process, and
 		its root certificate trusted automatically where possible.
 
+	.EXAMPLE
+		PS C:\> Start-MsGraphProxy -WatchPid $PID
+
+		Starts Dev Proxy, but only intercepts traffic from this PowerShell
+		session - every other proxy-aware app on the machine passes through
+		untouched instead of being mocked.
+
 	.LINK
 		https://mynster-it.dk/docs/modules/msgraphProxy/commands/Start-MsGraphProxy
 	#>
@@ -100,7 +130,13 @@
 
 		[ValidateSet('Free', 'P1', 'P2', 'Governance')]
 		[string]
-		$EntraIDLicense = 'P2'
+		$EntraIDLicense = 'P2',
+
+		[string[]]
+		$WatchProcessName,
+
+		[int[]]
+		$WatchPid
 	)
 
 	$existing = Get-MsGraphProxyStatus
@@ -141,6 +177,14 @@
 	$processArgs = @('--config-file', "`"$resolvedConfigFile`"", '--api-port', $ApiPort)
 	if (-not $NoRecord) {
 		$processArgs += '--record'
+	}
+	if ($WatchProcessName) {
+		$processArgs += '--watch-process-names'
+		$processArgs += $WatchProcessName
+	}
+	if ($WatchPid) {
+		$processArgs += '--watch-pids'
+		$processArgs += $WatchPid
 	}
 
 	if (Test-Path -Path $script:MsGraphProxyStdOutLog) { Remove-Item -Path $script:MsGraphProxyStdOutLog -Force }

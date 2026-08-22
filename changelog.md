@@ -1,5 +1,13 @@
 ﻿# Changelog
 
+## 1.0.4 (2026-08-22)
+
++ Add: Start-MsGraphProxy 2 new parameters `-WatchPid` and `-WatchProcessName` allows you to only capture network requests from either a specific service or process id
+
+## 1.0.3 (2026-08-17)
+
++ Fix: order of operation on release caused the latest prerelease of the binaries to not pick up the actual latest but the one before so release always took 1 version before release.
+
 ## 1.0.2 (2026-08-17)
 
 + Fix: order of operation on release caused the latest prerelease of the binaries to not pick up the actual latest but the one before so release always took 1 version before release.
