@@ -58,25 +58,34 @@
 		$apiPort = $script:MsGraphProxyDefaultApiPort
 	}
 
+	$apiToken = $null
+	try {
+		$apiToken = Get-MsGraphProxyApiToken -ProcessId $status.Id
+	} catch {
+		Write-Verbose "Couldn't fetch the Dev Proxy API token: $_"
+	}
+
 	$recording = $null
-	if ($status.Recording -and $status.ExePath) {
-		$recording = Receive-MsGraphProxyRecording -ApiPort $apiPort -WorkingDirectory (Split-Path -Path $status.ExePath -Parent)
+	if ($apiToken -and $status.Recording -and $status.ExePath) {
+		$recording = Receive-MsGraphProxyRecording -ApiPort $apiPort -Token $apiToken -WorkingDirectory (Split-Path -Path $status.ExePath -Parent)
 	}
 
 	$stoppedGracefully = $false
-	try {
-		Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$apiPort/proxy/stopProxy" -TimeoutSec 5 | Out-Null
+	if ($apiToken) {
+		try {
+			Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$apiPort/proxy/stopProxy" -Headers @{ Authorization = "Bearer $apiToken" } -TimeoutSec 5 | Out-Null
 
-		$deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-		while ((Get-Date) -lt $deadline) {
-			if (-not (Get-Process -Id $status.Id -ErrorAction SilentlyContinue)) {
-				$stoppedGracefully = $true
-				break
+			$deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+			while ((Get-Date) -lt $deadline) {
+				if (-not (Get-Process -Id $status.Id -ErrorAction SilentlyContinue)) {
+					$stoppedGracefully = $true
+					break
+				}
+				Start-Sleep -Milliseconds 250
 			}
-			Start-Sleep -Milliseconds 250
+		} catch {
+			Write-Verbose "Graceful stop via the API failed: $_"
 		}
-	} catch {
-		Write-Verbose "Graceful stop via the API failed: $_"
 	}
 
 	if (-not $stoppedGracefully) {
