@@ -25,6 +25,17 @@
     undiagnosable certificate behavior if upstream dev-proxy has changed that
     file.
 
+    Also patches GraphMinimalPermissionsPlugin.cs, GraphUtils.cs and
+    GraphMinimalPermissionsGuidancePlugin.cs: as of the newest tagged release
+    at the time of writing, all three still call the now-retired
+    devxapi-func-prod-eastus.azurewebsites.net host for minimal Graph
+    permissions, which returns an HTML 403 instead of JSON - the exception
+    from that aborts the whole report, so Stop-MsGraphProxy's Recording
+    silently comes back $null. Patched to the confirmed-working replacement
+    host, graph-devx-api.microsoft.com, with the exact same request/response
+    shape. This one patch is self-skipping per file once upstream ships the
+    same fix in a tagged release (see the inline comment at the patch site).
+
     This always works against a fresh clone in the temp folder, so the
     original dev-proxy checkout on this machine, if any, is never touched.
 
@@ -32,7 +43,23 @@
     One or more .NET runtime identifiers to build for.
 
 .PARAMETER Ref
-    Git branch of dotnet/dev-proxy to build from.
+    Git ref (tag, branch or commit) of dotnet/dev-proxy to build from.
+    Overrides -MajorVersion's auto-resolution entirely - pass this to pin
+    an exact version (e.g. for reproducing an issue) or to deliberately
+    test a new major line. Left unset (the default), the latest v<Major>.*
+    tag is resolved automatically every run.
+
+.PARAMETER MajorVersion
+    Caps auto-resolution (see -Ref) to this major version of dotnet/dev-proxy,
+    picking the newest matching tag (e.g. v3.4.0 over v3.3.1) so bugfixes and
+    non-breaking releases are picked up automatically without ever risking an
+    unreviewed major-version jump. This matters because this script's patches
+    (see the DESCRIPTION above) target exact code in ProxyEngine.cs and
+    GraphMockResponsePlugin.cs - as of this writing, main has removed
+    ProxyEngine.cs outright in favor of a new Kestrel-based engine, which
+    would make that patch throw immediately. Bump this deliberately, after
+    re-verifying every patch by hand against the new major version - never
+    just let it drift forward on its own.
 
 .PARAMETER OutputPath
     Directory to write the packaged zip files to.
@@ -52,7 +79,10 @@ param (
     $Rid = @('win-x64', 'linux-x64', 'osx-arm64'),
 
     [string]
-    $Ref = 'main',
+    $Ref,
+
+    [int]
+    $MajorVersion = 3,
 
     [string]
     $OutputPath = (Join-Path -Path $PSScriptRoot -ChildPath '..\package')
@@ -65,6 +95,21 @@ $cloneRoot = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "msgra
 
 if (-not (Test-Path -Path $OutputPath)) {
     New-Item -Path $OutputPath -ItemType Directory -Force | Out-Null
+}
+
+if (-not $Ref) {
+    Write-Verbose "Resolving the latest dotnet/dev-proxy v$MajorVersion.x.x tag (pass -Ref to pin an exact version instead)"
+    $tags = Invoke-RestMethod -Uri "https://api.github.com/repos/dotnet/dev-proxy/tags?per_page=100" -Headers @{ 'User-Agent' = 'msgraphProxy' }
+    $resolvedVersion = $tags.name |
+        Where-Object { $_ -match "^v$MajorVersion\.\d+\.\d+$" } |
+        ForEach-Object { [version]$_.TrimStart('v') } |
+        Sort-Object -Descending |
+        Select-Object -First 1
+    if (-not $resolvedVersion) {
+        throw "No v$MajorVersion.x.x tag found for dotnet/dev-proxy. Pass -Ref explicitly, or -MajorVersion to look for a different major line. Tags seen: $($tags.name -join ', ')"
+    }
+    $Ref = "v$resolvedVersion"
+    Write-Verbose "Resolved to $Ref"
 }
 
 try {
@@ -105,12 +150,20 @@ try {
     # after StartAsync returns - before Unobtanium's async accept loop
     # (BeginAcceptSocket) could possibly hand it a real connection - restores
     # correct per-domain certificate generation for all actual proxy traffic.
+    #
+    # Anchored on the StartAsync call alone, not "AddEndPoint immediately
+    # followed by StartAsync" - confirmed live that v3.3.1 inserted an
+    # unrelated `await ApiSecurity.SaveTokenAsync(stoppingToken);` line
+    # between the two (a new control-API auth feature), which broke an
+    # earlier version of this patch that required them adjacent. The
+    # StartAsync call itself (confirmed to appear exactly once in both
+    # v3.2.0 and v3.3.1) is what actually matters for this patch - inserting
+    # right after it is correct regardless of what upstream puts before it.
     $patches = @(
         [pscustomobject]@{
-            Label       = 'AddEndPoint/StartAsync call'
-            Pattern     = '(?<indent>[ \t]*)ProxyServer\.AddEndPoint\(_explicitEndPoint\);\s*await\s+ProxyServer\.StartAsync\(cancellationToken:\s*stoppingToken\);'
-            Replacement = "`${indent}ProxyServer.AddEndPoint(_explicitEndPoint);`n" +
-                          "`${indent}await ProxyServer.StartAsync(cancellationToken: stoppingToken);`n" +
+            Label       = 'StartAsync call'
+            Pattern     = '(?<indent>[ \t]*)await\s+ProxyServer\.StartAsync\(cancellationToken:\s*stoppingToken\);'
+            Replacement = "`${indent}await ProxyServer.StartAsync(cancellationToken: stoppingToken);`n" +
                           "`${indent}if (!_config.InstallCert)`n" +
                           "`${indent}{`n" +
                           "`${indent}    _explicitEndPoint.GenericCertificate = null;`n" +
@@ -166,6 +219,47 @@ try {
                                     "`${indent}var batchHeaders = ProxyUtils.BuildGraphResponseHeaders(e.Session.HttpClient.Request, batchRequestId, batchRequestDate);"
     $mockResponsePluginContent = $batchFallthroughPattern.Replace($mockResponsePluginContent, $batchFallthroughReplacement)
     Set-Content -Path $mockResponsePluginFile -Value $mockResponsePluginContent -NoNewline
+
+    # GraphMinimalPermissionsPlugin (and its delegated-scope helper GraphUtils,
+    # and the guidance-only GraphMinimalPermissionsGuidancePlugin) call a live
+    # Microsoft-hosted API to turn recorded requests into a minimal-permissions
+    # report. As of v3.3.1 (the newest tagged release at the time of writing)
+    # all three still hardcode the API's old hostname,
+    # devxapi-func-prod-eastus.azurewebsites.net, which now returns an HTML
+    # "403 Ip Forbidden" page instead of JSON - confirmed directly, this is
+    # what makes Stop-MsGraphProxy's Recording come back $null with no
+    # diagnostic (GraphMinimalPermissionsPlugin throws a JsonException trying
+    # to parse the HTML, aborting its report before it's ever written to
+    # disk). The replacement host, graph-devx-api.microsoft.com, is confirmed
+    # live with the exact same request/response shape - same query string,
+    # same POST body, same result JSON. Upstream already fixed this the same
+    # way on main (dotnet/dev-proxy#1900, merged after v3.3.1) - once that
+    # lands in a tagged v3.x release, -MajorVersion's auto-resolution picks it
+    # up on its own and the old host genuinely won't be there to find, so a
+    # missing anchor is treated as "already fixed upstream, nothing to do"
+    # rather than a hard failure - unlike the two structural patches above,
+    # where a missing anchor means upstream changed something unexpectedly.
+    Write-Verbose 'Patching the retired devxapi-func-prod-eastus.azurewebsites.net host to graph-devx-api.microsoft.com (skipped per-file if upstream already fixed it)'
+    $oldPermissionsHost = 'devxapi-func-prod-eastus.azurewebsites.net'
+    $newPermissionsHost = 'graph-devx-api.microsoft.com'
+    $permissionsHostFiles = @(
+        'DevProxy.Plugins\Reporting\GraphMinimalPermissionsPlugin.cs'
+        'DevProxy.Plugins\Reporting\GraphMinimalPermissionsGuidancePlugin.cs'
+        'DevProxy.Plugins\Utils\GraphUtils.cs'
+    )
+    foreach ($relativePath in $permissionsHostFiles) {
+        $filePath = Join-Path -Path $cloneRoot -ChildPath $relativePath
+        $content = Get-Content -Path $filePath -Raw
+        if ($content -notlike "*$oldPermissionsHost*") {
+            if ($content -like "*$newPermissionsHost*") {
+                Write-Verbose "$relativePath already uses $newPermissionsHost - upstream has fixed this one, nothing to patch."
+                continue
+            }
+            throw "Neither '$oldPermissionsHost' nor '$newPermissionsHost' found in $relativePath - upstream dev-proxy may have changed this file differently than expected. Aborting rather than silently shipping a package pointed at an unknown host."
+        }
+        $content = $content.Replace($oldPermissionsHost, $newPermissionsHost)
+        Set-Content -Path $filePath -Value $content -NoNewline
+    }
 
     foreach ($currentRid in $Rid) {
         Write-Verbose "Publishing devproxy for $currentRid"

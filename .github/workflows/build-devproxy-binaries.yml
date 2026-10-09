@@ -24,6 +24,12 @@ jobs:
 
             - name: Build Dev Proxy packages
               shell: pwsh
+              # No -Ref: the script auto-resolves the newest dev-proxy tag within
+              # -MajorVersion (default 3) on every run, so bugfix/minor releases
+              # are picked up without a workflow change. Bumping -MajorVersion is
+              # the deliberate, reviewed action - see Build-DevProxyPackage.ps1's
+              # -MajorVersion doc comment for why that one must never drift on
+              # its own.
               run: .\build\Build-DevProxyPackage.ps1 -Verbose
 
             - name: Upload packages
