@@ -26,11 +26,17 @@
 	.PARAMETER ApiPort
 		Port of Dev Proxy's control API.
 
+	.PARAMETER ProcessId
+		Process ID of the running Dev Proxy instance, used to look up its
+		control-API bearer token (see Get-MsGraphProxyApiToken) - every
+		request, including this one, is rejected with 401 without it.
+		Defaults to whatever Get-MsGraphProxyStatus currently reports.
+
 	.EXAMPLE
 		PS C:\> Install-MsGraphProxyCertificate
 
-		Fetches and trusts the root certificate of the Dev Proxy instance
-		using the default control-API port.
+		Fetches and trusts the root certificate of the currently running
+		Dev Proxy instance.
 
 	.LINK
 		https://mynster-it.dk/docs/modules/msgraphProxy/commands/Install-MsGraphProxyCertificate
@@ -39,7 +45,10 @@
 	[OutputType([bool])]
 	param (
 		[int]
-		$ApiPort = $script:MsGraphProxyDefaultApiPort
+		$ApiPort = $script:MsGraphProxyDefaultApiPort,
+
+		[int]
+		$ProcessId = (Get-MsGraphProxyStatus).Id
 	)
 
 	if (-not $IsWindows -and -not $IsLinux -and -not $IsMacOS) {
@@ -47,9 +56,16 @@
 		return $false
 	}
 
+	try {
+		$apiToken = Get-MsGraphProxyApiToken -ProcessId $ProcessId
+	} catch {
+		Write-Warning "Couldn't fetch the Dev Proxy root certificate: $_"
+		return $false
+	}
+
 	$certPath = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath 'msgraphproxy-devproxy-ca.crt'
 	try {
-		Invoke-WebRequest -Uri "http://127.0.0.1:$ApiPort/proxy/rootCertificate?format=crt" -OutFile $certPath -TimeoutSec 15
+		Invoke-WebRequest -Uri "http://127.0.0.1:$ApiPort/proxy/rootCertificate?format=crt" -Headers @{ Authorization = "Bearer $apiToken" } -OutFile $certPath -TimeoutSec 15
 	} catch {
 		Write-Warning "Couldn't fetch the Dev Proxy root certificate: $_"
 		return $false

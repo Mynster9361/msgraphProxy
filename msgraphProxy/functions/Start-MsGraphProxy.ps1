@@ -15,6 +15,13 @@
 		can stop it again and return the resulting reports (such as minimal
 		Graph permissions) as an object. Pass -NoRecord to opt out.
 
+		Dev Proxy's control API rejects every request, including a plain
+		status check, without its per-instance bearer token - generated at
+		process start and written to a file keyed by its PID (see
+		Get-MsGraphProxyApiToken). This waits for that file to appear, then
+		uses it for every control-API call this function and
+		Install-MsGraphProxyCertificate make.
+
 		While running, Dev Proxy intercepts and mocks calls to the hosts
 		listed in its "urlsToWatch" configuration (Microsoft Graph and the
 		Entra ID token endpoint, by default), tunnelling everything else
@@ -211,10 +218,20 @@
 
 	Write-Verbose "Dev Proxy started (PID $($process.Id)) using $resolvedConfigFile"
 
+	$apiToken = $null
+	try {
+		$apiToken = Get-MsGraphProxyApiToken -ProcessId $process.Id
+	} catch {
+		Write-Verbose "Couldn't fetch the Dev Proxy API token: $_"
+	}
+
 	$result = Get-MsGraphProxyStatus
-	$ready = Wait-MsGraphProxyControlApi -ApiPort $ApiPort
-	if ($ready) {
-		$ready = Wait-MsGraphProxyPort -ProxyPort $proxyPort
+	$ready = $false
+	if ($apiToken) {
+		$ready = Wait-MsGraphProxyControlApi -ApiPort $ApiPort -Token $apiToken
+		if ($ready) {
+			$ready = Wait-MsGraphProxyPort -ProxyPort $proxyPort
+		}
 	}
 
 	if (-not $ready) {
@@ -237,7 +254,7 @@
 
 		$certificateTrusted = $false
 		if ($ready) {
-			$certificateTrusted = Install-MsGraphProxyCertificate -ApiPort $ApiPort
+			$certificateTrusted = Install-MsGraphProxyCertificate -ApiPort $ApiPort -ProcessId $process.Id
 		} else {
 			Write-Warning 'Skipping automatic certificate trust since Dev Proxy never became ready.'
 		}

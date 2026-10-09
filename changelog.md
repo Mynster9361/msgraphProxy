@@ -1,5 +1,11 @@
 ﻿# Changelog
 
+## 1.1.1 (2026-10-09)
+
++ Fix: New devproxy release added security arround the proxy api meaning we needed a token in order to see queries processed.
++ Fix: Updated devproxy instance to fix a issue with the graph permission analysis as the endpoint was updated on Microsoft side from: "https://devxapi-func-prod-eastus.azurewebsites.net/permissions" to: "https://graph-devx-api.microsoft.com/permissions"
++ Add: New command `Get-MsGraphProxyApiToken` which gets the token for the currently running proxy
+
 ## 1.1.0 (2026-10-09)
 
 + Add: New CSDL files for v1.0 and beta adding new endpoints to the proxy

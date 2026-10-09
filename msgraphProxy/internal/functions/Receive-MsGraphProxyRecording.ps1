@@ -2,7 +2,7 @@
 	<#
 	.SYNOPSIS
 		Stops Dev Proxy's active recording and collects the resulting reports.
-	
+
 	.DESCRIPTION
 		Calls Dev Proxy's control API to stop recording, which synchronously
 		triggers its reporting plugins (such as GraphMinimalPermissionsPlugin and
@@ -11,16 +11,20 @@
 		their results as JSON files into Dev Proxy's working directory; this
 		function reads them, parses them, deletes them, and returns them as a
 		single object keyed by report name.
-	
+
 	.PARAMETER ApiPort
 		Port of Dev Proxy's control API.
-	
+
+	.PARAMETER Token
+		Bearer token for the control API (see Get-MsGraphProxyApiToken) -
+		every request, including this one, is rejected with 401 without it.
+
 	.PARAMETER WorkingDirectory
 		The directory Dev Proxy was started in, where report files are written.
-	
+
 	.EXAMPLE
-		PS C:\> Receive-MsGraphProxyRecording -ApiPort 8897 -WorkingDirectory 'C:\bin\win-x64'
-	
+		PS C:\> Receive-MsGraphProxyRecording -ApiPort 8897 -Token $token -WorkingDirectory 'C:\bin\win-x64'
+
 		Stops recording and returns any reports Dev Proxy generated.
 	#>
 	[CmdletBinding()]
@@ -28,6 +32,10 @@
 		[Parameter(Mandatory)]
 		[int]
 		$ApiPort,
+
+		[Parameter(Mandatory)]
+		[string]
+		$Token,
 
 		[Parameter(Mandatory)]
 		[string]
@@ -39,7 +47,7 @@
 		Remove-Item -Force -ErrorAction SilentlyContinue
 
 	try {
-		Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$ApiPort/proxy" `
+		Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$ApiPort/proxy" -Headers @{ Authorization = "Bearer $Token" } `
 			-ContentType 'application/json' -Body '{"recording":false}' -TimeoutSec 30 | Out-Null
 	} catch {
 		Write-Verbose "Stopping the recording via the API failed: $_"
