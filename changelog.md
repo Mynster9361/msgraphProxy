@@ -1,5 +1,9 @@
 ﻿# Changelog
 
+## 1.1.0 (2026-10-09)
+
++ Add: New CSDL files for v1.0 and beta adding new endpoints to the proxy
+
 ## 1.0.4 (2026-08-22)
 
 + Add: Start-MsGraphProxy 2 new parameters `-WatchPid` and `-WatchProcessName` allows you to only capture network requests from either a specific service or process id
