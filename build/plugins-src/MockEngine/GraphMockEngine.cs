@@ -53,6 +53,7 @@ public sealed partial class GraphMockEngine
         public required string BaseType { get; init; }
         public List<(string Name, string Type)> Properties { get; } = [];
         public List<(string Name, string Type)> NavigationProperties { get; } = [];
+        public HashSet<string> ContainedNavigations { get; } = new(StringComparer.OrdinalIgnoreCase);
     }
 
     private sealed class FunctionActionDef
@@ -146,7 +147,13 @@ public sealed partial class GraphMockEngine
         bool IsCount = false,
         FunctionActionDef? Operation = null,
         string? PropName = null,
-        string? SetOrSingletonName = null);
+        string? SetOrSingletonName = null,
+        string? PoolKey = null,
+        string? RelationKey = null,
+        string? CastType = null,
+        string? SeedType = null,
+        string? Owner = null,
+        bool Missing = false);
 
     private static readonly string[] UserDefaultProperties =
     [
@@ -400,6 +407,7 @@ public sealed partial class GraphMockEngine
 
         _entropy = new MockEntropy(_seed);
         _store.Clear();
+        _relations.Clear();
         _snapshots.Clear();
         _snapshotOrder.Clear();
         _faults.Reset();
@@ -872,9 +880,9 @@ public sealed partial class GraphMockEngine
         return null;
     }
 
-    private (JsonNode? Body, HttpStatusCode? StatusCode) HandleCollection(SchemaRegistry registry, string versionSegment, string typeFullName, string method, MockRequest request, QueryRestrictions? restrictions)
+    private (JsonNode? Body, HttpStatusCode? StatusCode) HandleCollection(SchemaRegistry registry, string versionSegment, ResolvedNode node, string method, MockRequest request, QueryRestrictions? restrictions)
     {
-        var pool = GetOrSeedPool(registry, typeFullName);
+        var typeFullName = node.TypeFullName;
 
         if (method == "GET")
         {
@@ -997,7 +1005,7 @@ public sealed partial class GraphMockEngine
                 }
             }
 
-            IEnumerable<JsonObject> filtered = pool;
+            IEnumerable<JsonObject> filtered = Members(registry, node);
             if (filterNode is not null)
             {
                 filtered = filtered.Where(filterNode.Evaluate);
@@ -1029,7 +1037,8 @@ public sealed partial class GraphMockEngine
             foreach (var item in page.Items)
             {
                 var trimmed = TrimTo(item, selectedProps);
-                ApplyExpand(registry, trimmed, typeFullName, request);
+                CopyODataType(item, trimmed);
+                ApplyExpand(registry, trimmed, TypeOf(item, typeFullName), request, OwnerOf(node, item));
                 array.Add(trimmed);
             }
 
@@ -1060,6 +1069,11 @@ public sealed partial class GraphMockEngine
 
         if (method == "POST")
         {
+            if (node.RelationKey is not null)
+            {
+                return (null, null); // relationships are changed through $ref
+            }
+
             var created = BuildEntity(registry, typeFullName);
             var bodyObj = ParseBody(request);
             if (bodyObj is not null)
@@ -1072,7 +1086,7 @@ public sealed partial class GraphMockEngine
                 created["id"] = MockAmbient.NewGuid("post:" + typeFullName).ToString();
             }
 
-            pool.Add(created);
+            GetOrSeedPool(registry, node.SeedType ?? typeFullName, node.PoolKey).Add(created);
             var createdBody = created.DeepClone().AsObject();
             createdBody["@odata.context"] = BuildODataContext(versionSegment, request) + "/$entity";
             return (createdBody, HttpStatusCode.Created);
@@ -1267,10 +1281,25 @@ public sealed partial class GraphMockEngine
         return $"{request.RequestUri.Scheme}://{request.RequestUri.Host}{versionSegment}$metadata#{firstSegment}";
     }
 
-    private (JsonNode? Body, HttpStatusCode? StatusCode) HandleItem(SchemaRegistry registry, string versionSegment, string typeFullName, string itemId, string method, MockRequest request, QueryRestrictions? restrictions)
+    private (JsonNode? Body, HttpStatusCode? StatusCode) HandleItem(SchemaRegistry registry, string versionSegment, ResolvedNode node, string method, MockRequest request, QueryRestrictions? restrictions)
     {
-        var pool = GetOrSeedPool(registry, typeFullName);
-        var existing = pool.FindById(itemId);
+        var typeFullName = node.TypeFullName;
+        var itemId = node.ItemId!;
+        var collection = node with { ItemId = null, IsCollection = true };
+        var pool = node.RelationKey is null && node.CastType is null ? GetOrSeedPool(registry, node.SeedType ?? typeFullName, node.PoolKey) : null;
+        var existing = pool is not null ? pool.FindById(itemId) : FindMember(registry, collection, itemId);
+
+        // A root set of a base type (/directoryObjects/{id}) resolves any record of a derived type, like Graph.
+        if (existing is null && pool is not null && node.PoolKey == (node.SeedType ?? typeFullName) && FindDerivedRecord(registry, typeFullName, itemId) is { } derived)
+        {
+            if (method != "GET")
+            {
+                return (null, null);
+            }
+
+            existing = derived;
+            pool = null;
+        }
 
         // unifiedRoleManagementAlert is unlike every other by-id entity here: its
         // ids aren't arbitrary keys of user-created resources, they're a small,
@@ -1284,7 +1313,7 @@ public sealed partial class GraphMockEngine
         // this type materializes an inactive alert on first request instead of
         // 404ing - matching real Graph's behavior for a clean tenant, and letting
         // Maester's PIM alert checks (MT.1029-MT.1032) evaluate instead of erroring.
-        if (existing is null && string.Equals(typeFullName, "microsoft.graph.unifiedRoleManagementAlert", StringComparison.Ordinal))
+        if (existing is null && pool is not null && string.Equals(typeFullName, "microsoft.graph.unifiedRoleManagementAlert", StringComparison.Ordinal))
         {
             existing = BuildEntity(registry, typeFullName);
             existing["id"] = itemId;
@@ -1314,16 +1343,27 @@ public sealed partial class GraphMockEngine
                     }
 
                     var trimmed = TrimTo(existing, GetSelectedProps(registry, typeFullName, request));
-                    ApplyExpand(registry, trimmed, typeFullName, request);
+                    CopyODataType(existing, trimmed);
+                    ApplyExpand(registry, trimmed, TypeOf(existing, typeFullName), request, OwnerOf(collection, existing));
                     trimmed["@odata.context"] = BuildODataContext(versionSegment, request) + "/$entity";
                     return (trimmed, HttpStatusCode.OK);
                 }
             case "DELETE":
+                if (pool is null)
+                {
+                    return (null, null); // a relationship member is removed through .../{id}/$ref
+                }
+
                 _ = pool.Remove(existing);
                 return (null, HttpStatusCode.NoContent);
             case "PATCH":
             case "PUT":
                 {
+                    if (pool is null)
+                    {
+                        return (null, null);
+                    }
+
                     var bodyObj = ParseBody(request);
                     if (bodyObj is not null)
                     {
@@ -1338,15 +1378,34 @@ public sealed partial class GraphMockEngine
         }
     }
 
-    private (JsonNode? Body, HttpStatusCode? StatusCode) HandleSingleton(SchemaRegistry registry, string versionSegment, string typeFullName, string method, MockRequest request, QueryRestrictions? restrictions)
+    private (JsonNode? Body, HttpStatusCode? StatusCode) HandleSingleton(SchemaRegistry registry, string versionSegment, ResolvedNode node, string method, MockRequest request, QueryRestrictions? restrictions)
     {
+        var typeFullName = node.TypeFullName;
         if (method is not ("GET" or "PATCH" or "PUT"))
         {
             return (null, null);
         }
 
-        var pool = GetOrSeedPool(registry, typeFullName);
-        var record = pool[0];
+        JsonObject record;
+        if (node.RelationKey is not null)
+        {
+            // A to-one relationship (manager, drive): the referenced record, read-only here.
+            if (method != "GET")
+            {
+                return (null, null);
+            }
+
+            if (Members(registry, node).FirstOrDefault() is not { } target)
+            {
+                return (ODataError("Request_ResourceNotFound", "Resource not found for the segment."), HttpStatusCode.NotFound);
+            }
+
+            record = target;
+        }
+        else
+        {
+            record = GetOrSeedPool(registry, node.SeedType ?? typeFullName, node.PoolKey)[0];
+        }
 
         if (method is "PATCH" or "PUT")
         {
@@ -1372,7 +1431,9 @@ public sealed partial class GraphMockEngine
         }
 
         var trimmedRecord = TrimTo(record, GetSelectedProps(registry, typeFullName, request));
-        ApplyExpand(registry, trimmedRecord, typeFullName, request);
+        CopyODataType(record, trimmedRecord);
+        ApplyExpand(registry, trimmedRecord, TypeOf(record, typeFullName), request,
+            node.RelationKey is null ? node.Owner ?? node.PoolKey : Scope(TypeOf(record, typeFullName), IdOf(record) ?? ""));
         trimmedRecord["@odata.context"] = BuildODataContext(versionSegment, request) + "/$entity";
         return (trimmedRecord, HttpStatusCode.OK);
     }
@@ -1503,7 +1564,7 @@ public sealed partial class GraphMockEngine
         }
 
         var rawBody = node.IsCount
-            ? GetOrSeedPool(registry, node.TypeFullName).Count.ToString(CultureInfo.InvariantCulture)
+            ? Members(registry, node).Count.ToString(CultureInfo.InvariantCulture)
             : FakePrimitive(node.TypeFullName, node.PropName ?? "value")?.ToString() ?? "";
 
         return new MockResult(null, HttpStatusCode.OK, RawText: rawBody, LogLabel: node.IsCount ? "$count" : "$value");
@@ -1540,6 +1601,11 @@ public sealed partial class GraphMockEngine
         }
 
         var node = resolved.Value;
+        if (node.Missing)
+        {
+            return new MockResult(ODataError("Request_ResourceNotFound", $"Resource '{node.ItemId}' does not exist or one of its queried reference-property objects are not present."), HttpStatusCode.NotFound, LogLabel: "unknown key");
+        }
+
         if (node.IsValue || node.IsCount)
         {
             return HandleRawSegmentValue(registry, node, method, request);
@@ -1548,14 +1614,14 @@ public sealed partial class GraphMockEngine
         var restrictions = GetRestrictions(registry, node.SetOrSingletonName, node.TypeFullName);
         _pendingHeaders = null;
         var (responseBody, statusCode) = node.IsRef
-            ? HandleRef(node, method, request)
+            ? (node.RelationKey is not null ? HandleRelationRef(registry, node, method, request, versionSegment) : HandleRef(node, method, request))
             : node.Operation is not null
                 ? (node.Operation.IsAction ? HandleAction(registry, node.Operation, method, request) : HandleFunction(registry, node.Operation, method, request))
                 : node.IsCollection
-                    ? HandleCollection(registry, versionSegment, node.TypeFullName, method, request, restrictions)
+                    ? HandleCollection(registry, versionSegment, node, method, request, restrictions)
                     : node.ItemId is not null
-                        ? HandleItem(registry, versionSegment, node.TypeFullName, node.ItemId, method, request, restrictions)
-                        : HandleSingleton(registry, versionSegment, node.TypeFullName, method, request, restrictions);
+                        ? HandleItem(registry, versionSegment, node, method, request, restrictions)
+                        : HandleSingleton(registry, versionSegment, node, method, request, restrictions);
 
         var extraHeaders = _pendingHeaders;
         _pendingHeaders = null;
@@ -1603,13 +1669,17 @@ public sealed partial class GraphMockEngine
         return selectParam is not null ? SplitSelect(selectParam) : DefaultProps(registry, typeFullName);
     }
 
-    private EntityPool GetOrSeedPool(SchemaRegistry registry, string typeFullName)
+    /// <param name="poolKey">Null (or the type) for a root set; "{owner}/{navigation}" for a contained navigation (P1 #9).</param>
+    private EntityPool GetOrSeedPool(SchemaRegistry registry, string typeFullName, string? poolKey = null)
     {
-        if (_store.TryGetValue(typeFullName, out var pool))
+        var key = poolKey ?? typeFullName;
+        if (_store.TryGetValue(key, out var pool))
         {
             return pool;
         }
 
+        // Values generated for this pool depend only on its key, not on the order pools are first touched.
+        using var entropyScope = _entropy.Within("pool:" + key);
         var seeded = string.Equals(typeFullName, "microsoft.graph.subscribedSku", StringComparison.Ordinal) && _subscribedSkus.Count > 0
             ? SeedSubscribedSkuPool(registry, _subscribedSkus)
             : SeedGenericPool(registry, typeFullName, _determinism.PoolSizeFor(typeFullName));
@@ -1622,13 +1692,22 @@ public sealed partial class GraphMockEngine
             {
                 if (seeded[i].ContainsKey("id"))
                 {
-                    seeded[i]["id"] = _entropy.Named("id:" + typeFullName + "#" + i.ToString(CultureInfo.InvariantCulture)).ToString();
+                    seeded[i]["id"] = _entropy.Named("id:" + key + "#" + i.ToString(CultureInfo.InvariantCulture)).ToString();
                 }
             }
         }
 
+        // Unseeded scoped pools still need ids distinct from the root pool's copies they're cloned from.
+        if (!_entropy.IsSeeded && poolKey is not null && poolKey != typeFullName)
+        {
+            foreach (var record in seeded.Where(r => r.ContainsKey("id")))
+            {
+                record["id"] = MockAmbient.NewGuid("prop:id").ToString();
+            }
+        }
+
         var created = new EntityPool(seeded);
-        _store[typeFullName] = created;
+        _store[key] = created;
         return created;
     }
 
@@ -1757,16 +1836,18 @@ public sealed partial class GraphMockEngine
 
     // --- Path resolution ---
 
-    private static ResolvedNode? ResolvePath(SchemaRegistry registry, string[] segments)
+    private ResolvedNode? ResolvePath(SchemaRegistry registry, string[] segments)
     {
         ResolvedNode current;
         if (registry.EntitySets.TryGetValue(segments[0], out var entitySetType))
         {
-            current = new ResolvedNode(ResolveRefName(registry, entitySetType), true, null, SetOrSingletonName: segments[0]);
+            var setType = ResolveRefName(registry, entitySetType);
+            current = new ResolvedNode(setType, true, null, SetOrSingletonName: segments[0], PoolKey: setType, SeedType: setType);
         }
         else if (registry.Singletons.TryGetValue(segments[0], out var singletonType))
         {
-            current = new ResolvedNode(ResolveRefName(registry, singletonType), false, null, SetOrSingletonName: segments[0]);
+            var type = ResolveRefName(registry, singletonType);
+            current = new ResolvedNode(type, false, null, SetOrSingletonName: segments[0], PoolKey: type, SeedType: type, Owner: type);
         }
         else
         {
@@ -1781,9 +1862,7 @@ public sealed partial class GraphMockEngine
             {
                 if (string.Equals(segment, "$ref", StringComparison.OrdinalIgnoreCase) && isLast)
                 {
-                    // .../{navProperty}/$ref or .../{navProperty}/{id}/$ref - a
-                    // relationship request against whatever navigation property
-                    // was just resolved, rather than the entity itself.
+                    // .../{navProperty}/$ref or .../{navProperty}/{id}/$ref - a relationship request.
                     return current with { IsRef = true };
                 }
 
@@ -1792,27 +1871,42 @@ public sealed partial class GraphMockEngine
                     return current with { IsCount = true };
                 }
 
-                // $value on its own (not right after a property), $top, etc. -
-                // not supported, let the request fall through.
+                // $value on its own (not right after a property), $top, etc. - not supported.
                 return null;
             }
 
             if (current.IsCollection)
             {
-                // A collection-bound Function/Action (e.g. GET /applications/delta())
-                // always terminates the path - try it before assuming the segment is
-                // an item id, which is what every such segment resolved to before.
+                // A collection-bound Function/Action (e.g. GET /applications/delta()) always terminates the path.
                 var collectionOp = TryMatchBoundOperation(registry, current, segment);
                 if (collectionOp is not null)
                 {
                     return isLast ? current with { Operation = collectionOp } : null;
                 }
 
-                // a segment right after a collection is always an item id - `with`
-                // (not a fresh ResolvedNode) so SetOrSingletonName survives: a
-                // restriction against the "users" entity set still applies to
-                // GET /users/{id}, not just the bare collection.
-                current = current with { IsCollection = false, ItemId = segment };
+                // Cast to a derived type: /groups/{id}/members/microsoft.graph.user (P1 #11).
+                if (TryCast(registry, current.TypeFullName, segment) is { } cast)
+                {
+                    current = current with { TypeFullName = cast, CastType = cast };
+                    continue;
+                }
+
+                // An item id. With key validation on, an unknown id anywhere in the path is a 404 (P1 #9).
+                var found = FindMember(registry, current, segment);
+                if (found is null && ValidatePathKeysEnabled && !isLast)
+                {
+                    return current with { IsCollection = false, ItemId = segment, Missing = true };
+                }
+
+                var itemType = found is not null ? TypeOf(found, current.SeedType ?? current.TypeFullName) : current.TypeFullName;
+                var owner = current.RelationKey is null ? Scope(current.PoolKey ?? current.TypeFullName, segment) : Scope(itemType, segment);
+                current = current with { IsCollection = false, ItemId = segment, Owner = owner };
+                continue;
+            }
+
+            if (TryCast(registry, current.TypeFullName, segment) is { } entityCast)
+            {
+                current = current with { TypeFullName = entityCast, CastType = entityCast };
                 continue;
             }
 
@@ -1828,9 +1922,7 @@ public sealed partial class GraphMockEngine
 
             if (navMatch is null)
             {
-                // Try a singleton/item-bound Function/Action (e.g. .../{id}/checkMemberGroups)
-                // only after a real navigation property, so an existing nav-property route can
-                // never be shadowed by a same-named Function/Action.
+                // A singleton/item-bound Function/Action, only after real navigation properties.
                 var itemOp = TryMatchBoundOperation(registry, current, segment);
                 if (itemOp is not null)
                 {
@@ -1851,7 +1943,25 @@ public sealed partial class GraphMockEngine
                 return null;
             }
 
-            current = new ResolvedNode(ResolveRefName(registry, StripCollection(navMatch.Value.Type)), IsCollectionType(navMatch.Value.Type), null);
+            var navType = ResolveRefName(registry, StripCollection(navMatch.Value.Type));
+            var navIsCollection = IsCollectionType(navMatch.Value.Type);
+            var ownerKey = current.Owner ?? current.PoolKey ?? current.TypeFullName;
+            if (IsContainedNav(registry, current.TypeFullName, navMatch.Value.Name))
+            {
+                var poolKey = ownerKey + "/" + navMatch.Value.Name;
+                current = new ResolvedNode(navType, navIsCollection, null, PoolKey: poolKey, SeedType: navType, Owner: navIsCollection ? null : poolKey);
+            }
+            else
+            {
+                var relationKey = ownerKey + "|" + navMatch.Value.Name;
+                current = new ResolvedNode(navType, navIsCollection, null, RelationKey: relationKey, SeedType: navType);
+                if (!navIsCollection && !isLast)
+                {
+                    // Walking through a to-one relationship (/users/{id}/manager/directReports): continue from the target.
+                    var target = Members(registry, current).FirstOrDefault();
+                    current = current with { Owner = target is null ? relationKey : Scope(TypeOf(target, navType), IdOf(target) ?? "") };
+                }
+            }
         }
 
         return current;
@@ -2184,7 +2294,7 @@ public sealed partial class GraphMockEngine
     // after TrimTo, mutating the trimmed object: otherwise an expanded property
     // absent from $select/DefaultProps would immediately be stripped back out,
     // whereas real Graph always surfaces an expanded property regardless of $select.
-    private void ApplyExpand(SchemaRegistry registry, JsonObject target, string typeFullName, MockRequest request)
+    private void ApplyExpand(SchemaRegistry registry, JsonObject target, string typeFullName, MockRequest request, string? owner = null)
     {
         var query = System.Web.HttpUtility.ParseQueryString(request.RequestUri.Query);
         var expandParam = query["$expand"];
@@ -2216,7 +2326,7 @@ public sealed partial class GraphMockEngine
             // wrong can't change which records match.
             if (match is not null)
             {
-                target[match.Value.Name] = ExpandFromPool(registry, target, match.Value.Name, match.Value.Type)
+                target[match.Value.Name] = ExpandFromPool(registry, target, typeFullName, match.Value.Name, match.Value.Type, owner)
                     ?? BuildValue(registry, match.Value.Type, match.Value.Name, 1);
             }
         }
@@ -2227,7 +2337,7 @@ public sealed partial class GraphMockEngine
     // Per-parent relationship data is P1 #9/#10; until then every parent sees the same members.
     private const int MaxExpandedItems = 20;
 
-    private JsonNode? ExpandFromPool(SchemaRegistry registry, JsonObject target, string navName, string navType)
+    private JsonNode? ExpandFromPool(SchemaRegistry registry, JsonObject target, string targetType, string navName, string navType, string? owner)
     {
         var entityType = ResolveRefName(registry, StripCollection(navType));
         if (!IsEntityLike(registry, entityType))
@@ -2235,20 +2345,27 @@ public sealed partial class GraphMockEngine
             return null;
         }
 
-        var pool = GetOrSeedPool(registry, entityType);
-        if (IsCollectionType(navType))
+        owner ??= Scope(targetType, IdOf(target) ?? "");
+        var isCollection = IsCollectionType(navType);
+        var node = IsContainedNav(registry, targetType, navName)
+            ? new ResolvedNode(entityType, isCollection, null, PoolKey: owner + "/" + navName, SeedType: entityType)
+            : new ResolvedNode(entityType, isCollection, null, RelationKey: owner + "|" + navName, SeedType: entityType);
+        var members = Members(registry, node);
+        if (isCollection)
         {
-            return new JsonArray([.. pool.Take(MaxExpandedItems).Select(item => (JsonNode)item.DeepClone())]);
+            return new JsonArray([.. members.Take(MaxExpandedItems).Select(item => (JsonNode)item.DeepClone())]);
         }
 
-        var parentId = target["id"] is JsonValue idValue && idValue.TryGetValue(out string? id) ? id : "";
-        var index = (int)(StableHash(parentId + "/" + navName) % (uint)pool.Count);
-        if (pool.Count > 1 && pool[index]["id"] is JsonValue picked && picked.TryGetValue(out string? pickedId) && pickedId == parentId)
-        {
-            index = (index + 1) % pool.Count; // a user is not their own manager
-        }
+        return members.FirstOrDefault()?.DeepClone();
+    }
 
-        return pool[index].DeepClone();
+    // Items reached through a relationship carry @odata.type; keep it through $select trimming.
+    private static void CopyODataType(JsonObject source, JsonObject trimmed)
+    {
+        if (source["@odata.type"] is JsonValue type)
+        {
+            trimmed["@odata.type"] = type.DeepClone();
+        }
     }
 
     // string.GetHashCode is randomized per process; this must be stable across runs.
@@ -3070,6 +3187,10 @@ public sealed partial class GraphMockEngine
             foreach (Match np in Regex.Matches(inner, @"<NavigationProperty Name=""([^""]+)"" Type=""([^""]+)""[^>]*?(?:/>|>.*?</NavigationProperty>)", RegexOptions.Singleline))
             {
                 def.NavigationProperties.Add((np.Groups[1].Value, np.Groups[2].Value));
+                if (np.Value.Contains("ContainsTarget=\"true\"", StringComparison.OrdinalIgnoreCase))
+                {
+                    def.ContainedNavigations.Add(np.Groups[1].Value);
+                }
             }
 
             registry.Types[$"{namespaceName}.{name}"] = def;

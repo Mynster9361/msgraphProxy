@@ -38,6 +38,9 @@ public sealed class GraphSchemaMockPluginConfiguration
     // Unknown $select names get Graph's 400. Set false for clients that select properties this CSDL
     // doesn't declare.
     public bool ValidateSelect { get; set; } = true;
+    // 404 for an unknown id anywhere in the path (/users/{unknown}/messages), like Graph. Off by default for
+    // callers that rely on any parent id working.
+    public bool ValidatePathKeys { get; set; }
     // Fault injection and throttling: rules (path glob, method, query, header, direct/batch -> status,
     // Retry-After, probability, everyNth, maxHits, latencyMs), token buckets per workload/app/mailbox,
     // and mailboxConcurrencyLimit (Graph's is 4). Off unless configured.
@@ -101,6 +104,7 @@ public sealed class GraphSchemaMockPlugin(
         _engine = new GraphMockEngine(v1Csdl, betaCsdl, Configuration.SubscribedSkus, Configuration.Paging, Configuration.Determinism, Configuration.Faults)
         {
             ValidateSelectEnabled = Configuration.ValidateSelect,
+            ValidatePathKeysEnabled = Configuration.ValidatePathKeys,
         };
         _graphHosts = new GraphHosts(Configuration.AdditionalGraphHosts);
         LogRegistryLoaded("v1.0", schemaFilePath);

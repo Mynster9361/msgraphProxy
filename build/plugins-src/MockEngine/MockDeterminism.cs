@@ -87,8 +87,25 @@ public sealed class MockClock : TimeProvider
 internal sealed class MockEntropy(int? seed)
 {
     private readonly Dictionary<string, int> _counters = new(StringComparer.Ordinal);
+    private string _prefix = "";
 
     public bool IsSeeded => seed is not null;
+
+    /// <summary>
+    /// Scopes every sequence to a prefix (a pool key) until disposed, so values generated while seeding a pool
+    /// depend only on that pool, not on which pools were seeded before it (request order varies under load).
+    /// </summary>
+    public PrefixScope Within(string prefix)
+    {
+        var previous = _prefix;
+        _prefix = prefix + "|";
+        return new PrefixScope(this, previous);
+    }
+
+    internal readonly struct PrefixScope(MockEntropy owner, string previous) : IDisposable
+    {
+        public void Dispose() => owner._prefix = previous;
+    }
 
     /// <summary>The next GUID in a named sequence ("post:microsoft.graph.group", "request", ...).</summary>
     public Guid Next(string scope)
@@ -98,6 +115,7 @@ internal sealed class MockEntropy(int? seed)
             return Guid.NewGuid();
         }
 
+        scope = _prefix + scope;
         var n = _counters.TryGetValue(scope, out var current) ? current + 1 : 1;
         _counters[scope] = n;
         return Named(scope + "#" + n.ToString(CultureInfo.InvariantCulture));

@@ -207,6 +207,25 @@ try {
         if ($r.StatusCode -ne 204) { throw "expected 204, got $($r.StatusCode)" }
     }
 
+    Test-Check 'contained collections hold different data per parent (P1 #9)' {
+        $ids = (Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/users?$top=2&$select=id' -Headers $headers -SkipCertificateCheck -TimeoutSec 15).value.id
+        $a = (Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/$($ids[0])/messages?`$select=id" -Headers $headers -SkipCertificateCheck -TimeoutSec 15).value.id
+        $b = (Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/$($ids[1])/messages?`$select=id" -Headers $headers -SkipCertificateCheck -TimeoutSec 15).value.id
+        if (-not $a -or -not $b) { throw 'expected messages for both users' }
+        if (@($a | Where-Object { $b -contains $_ }).Count -gt 0) { throw 'two users share message ids' }
+    }
+
+    Test-Check 'relationships point at real records with @odata.type, and casts filter (P1 #10, #11)' {
+        $group = (Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/groups?$top=1&$select=id' -Headers $headers -SkipCertificateCheck -TimeoutSec 15).value[0].id
+        $members = (Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/groups/$group/members" -Headers $headers -SkipCertificateCheck -TimeoutSec 15).value
+        if (-not $members) { throw 'expected group members' }
+        if (@($members | Where-Object { $_.'@odata.type' -ne '#microsoft.graph.user' }).Count -gt 0) { throw 'members should be users with @odata.type' }
+        $user = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/$($members[0].id)" -Headers $headers -SkipCertificateCheck -TimeoutSec 15
+        if ($user.id -ne $members[0].id) { throw 'a member should resolve at /users/{id}' }
+        $cast = (Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/groups/$group/members/microsoft.graph.user" -Headers $headers -SkipCertificateCheck -TimeoutSec 15).value
+        if (@($cast).Count -ne @($members).Count) { throw "cast returned $(@($cast).Count) of $(@($members).Count) members" }
+    }
+
     Test-Check 'POST .../checkMemberGroups (bound Action) returns a value array' {
         $body = @{ groupIds = @('33333333-3333-3333-3333-333333333333') } | ConvertTo-Json
         $r = Invoke-RestMethod -Method POST -Uri "https://graph.microsoft.com/v1.0/users/$userId/checkMemberGroups" -Headers $headers -Body $body -ContentType 'application/json' -SkipCertificateCheck -TimeoutSec 15
@@ -465,7 +484,7 @@ try {
             requests = @(
                 @{ id = '1'; method = 'GET'; url = '/users' }
                 @{ id = '2'; method = 'GET'; url = "/users/$userId" }
-                @{ id = '3'; method = 'POST'; url = "/groups/22222222-2222-2222-2222-222222222222/members/`$ref"; body = @{ '@odata.id' = 'https://graph.microsoft.com/v1.0/directoryObjects/11111111-1111-1111-1111-111111111111' }; headers = @{ 'Content-Type' = 'application/json' } }
+                @{ id = '3'; method = 'POST'; url = "/groups/22222222-2222-2222-2222-222222222222/members/`$ref"; body = @{ '@odata.id' = 'https://graph.microsoft.com/v1.0/directoryObjects/33333333-3333-3333-3333-333333333333' }; headers = @{ 'Content-Type' = 'application/json' } }
             )
         } | ConvertTo-Json -Depth 10
         $r = Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/$batch' -Method POST -Headers $headers -Body $body -ContentType 'application/json' -SkipCertificateCheck -TimeoutSec 15
