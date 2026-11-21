@@ -2,6 +2,7 @@
 
 ## 1.2.0 (2026-11-21)
 
++ Fix: Build-DevProxyPackage.ps1 builds Dev Proxy with a pinned .NET SDK (latest stable 10.0.x; `-SdkVersion`). Without it, the newest SDK on the machine (on hosted runners the .NET 11 SDK) decided which analyzer rules fail Dev Proxy's warnings-as-errors build. A failed `dotnet publish`/`build` now stops the script with a clear message.
 + Change: GraphSchemaMockPlugin's mock logic now lives in an engine-agnostic `MockEngine` (build/plugins-src/MockEngine/) with no Dev Proxy dependencies. The plugin is a thin Dev Proxy v3 adapter. Behavior is unchanged; all smoke checks pass.
 + Add: `GraphMockHttpMessageHandler` runs the same engine in-process behind an `HttpClient`, with no proxy, certificates or network.
 + Change: Build-DevProxyPackage.ps1 copies plugin sources recursively so subfolders are compiled.

@@ -137,8 +137,6 @@ try {
             ConvertTo-Json | Set-Content -Path (Join-Path -Path $cloneRoot -ChildPath 'global.json') -Encoding utf8
     }
 
-    Push-Location $cloneRoot
-    try { Write-Verbose "Building with .NET SDK $(dotnet --version)" } finally { Pop-Location }
 
     Write-Verbose 'Adding msgraphProxy plugin sources'
     $pluginsMockingDir = Join-Path -Path $cloneRoot -ChildPath 'DevProxy.Plugins\Mocking'
@@ -292,16 +290,23 @@ try {
         Set-Content -Path $filePath -Value $content -NoNewline
     }
 
+    # The .NET CLI looks for global.json from the current directory, not the project's, so build from the clone
+    # or the pin above doesn't apply.
+    Push-Location -Path $cloneRoot
+    try {
+    Write-Verbose "Building with .NET SDK $(dotnet --version)"
     foreach ($currentRid in $Rid) {
         Write-Verbose "Publishing devproxy for $currentRid"
         $publishDir = Join-Path -Path $cloneRoot -ChildPath "dist\$currentRid"
         $devProxyProject = Join-Path -Path $cloneRoot -ChildPath 'DevProxy\DevProxy.csproj'
 
         dotnet publish $devProxyProject -c Release -r $currentRid --self-contained true -o $publishDir
+        if ($LASTEXITCODE -ne 0) { throw "dotnet publish of Dev Proxy for $currentRid failed (exit code $LASTEXITCODE)." }
 
         Write-Verbose "Building plugins for $currentRid"
         $pluginsProject = Join-Path -Path $cloneRoot -ChildPath 'DevProxy.Plugins\DevProxy.Plugins.csproj'
         dotnet build $pluginsProject -c Release -r $currentRid --no-self-contained
+        if ($LASTEXITCODE -ne 0) { throw "dotnet build of the plugins for $currentRid failed (exit code $LASTEXITCODE)." }
 
         $builtPluginsDir = Join-Path -Path $cloneRoot -ChildPath "DevProxy\bin\Release\net10.0\$currentRid\plugins"
         $publishedPluginsDir = Join-Path -Path $publishDir -ChildPath 'plugins'
@@ -314,6 +319,10 @@ try {
         Compress-Archive -Path (Join-Path -Path $publishDir -ChildPath '*') -DestinationPath $zipPath
 
         Write-Verbose "Packaged $currentRid to $zipPath"
+    }
+    }
+    finally {
+        Pop-Location
     }
 }
 finally {
