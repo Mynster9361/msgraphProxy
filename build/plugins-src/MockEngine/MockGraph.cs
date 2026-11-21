@@ -240,6 +240,12 @@ public sealed partial class GraphMockEngine
                 return (null, null);
             }
 
+            var removed = refs.Where(r => r.Id == removeId).ToList();
+            foreach (var r in removed)
+            {
+                RecordRelation(relationKey, r.Type, r.Id, added: false);
+            }
+
             return refs.RemoveAll(r => r.Id == removeId) > 0
                 ? (null, HttpStatusCode.NoContent)
                 : (ODataError("Request_ResourceNotFound", $"Resource '{removeId}' does not exist or one of its queried reference-property objects are not present."), HttpStatusCode.NotFound);
@@ -256,6 +262,11 @@ public sealed partial class GraphMockEngine
 
         if (method == "DELETE" && !isCollection)
         {
+            foreach (var r in refs)
+            {
+                RecordRelation(relationKey, r.Type, r.Id, added: false);
+            }
+
             refs.Clear();
             return (null, HttpStatusCode.NoContent);
         }
@@ -284,11 +295,18 @@ public sealed partial class GraphMockEngine
             }
 
             refs.Add((type, id));
+            RecordRelation(relationKey, type, id, added: true);
         }
         else
         {
+            foreach (var r in refs)
+            {
+                RecordRelation(relationKey, r.Type, r.Id, added: false);
+            }
+
             refs.Clear();
             refs.Add((type, id));
+            RecordRelation(relationKey, type, id, added: true);
         }
 
         return (null, HttpStatusCode.NoContent);

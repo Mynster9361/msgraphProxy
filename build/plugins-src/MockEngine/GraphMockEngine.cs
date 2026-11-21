@@ -426,6 +426,7 @@ public sealed partial class GraphMockEngine
         _entropy = new MockEntropy(_seed);
         _store.Clear();
         _relations.Clear();
+        ResetDelta();
         _snapshots.Clear();
         _snapshotOrder.Clear();
         _faults.Reset();
@@ -505,6 +506,10 @@ public sealed partial class GraphMockEngine
                         Clock.Advance(TimeSpan.FromSeconds(seconds));
                         return MockControl.Ok(new { now = Clock.GetUtcNow(), clockFixed = true });
                     }
+
+                case ("delta/expire", "POST"):
+                    _deltaEpoch++; // every delta token handed out so far now gets 410 Gone
+                    return MockControl.Ok(new { expired = true, epoch = _deltaEpoch });
 
                 case ("scenario", "GET"):
                     return MockControl.Ok(_faults.Options);
@@ -1105,6 +1110,7 @@ public sealed partial class GraphMockEngine
             }
 
             GetOrSeedPool(registry, node.SeedType ?? typeFullName, node.PoolKey).Add(created);
+            RecordUpsert(PoolKeyOf(node), IdOf(created));
             var createdBody = created.DeepClone().AsObject();
             createdBody["@odata.context"] = BuildODataContext(versionSegment, request) + "/$entity";
             return (createdBody, HttpStatusCode.Created);
@@ -1339,6 +1345,14 @@ public sealed partial class GraphMockEngine
             pool.Add(existing);
         }
 
+        // /users/{id}/messages/{id} resolves a message in any of the mailbox's folders, like Graph (likewise events
+        // in calendars and contacts in contact folders). Read-only: changes still go through the folder.
+        if (existing is null && pool is not null && method == "GET" && FindInMailboxFolders(node.PoolKey, itemId) is { } inFolder)
+        {
+            existing = inFolder;
+            pool = null;
+        }
+
         if (existing is null)
         {
             return (ODataError("Request_ResourceNotFound", $"Resource '{itemId}' does not exist or one of its queried reference-property objects are not present."), HttpStatusCode.NotFound);
@@ -1373,6 +1387,8 @@ public sealed partial class GraphMockEngine
                 }
 
                 _ = pool.Remove(existing);
+                RecordRemoved(PoolKeyOf(collection), node.SeedType ?? typeFullName, itemId);
+                RemoveFromRelationships(node.SeedType ?? typeFullName, itemId);
                 return (null, HttpStatusCode.NoContent);
             case "PATCH":
             case "PUT":
@@ -1387,6 +1403,7 @@ public sealed partial class GraphMockEngine
                     {
                         MergeInto(existing, bodyObj);
                         pool.Reindex();
+                        RecordUpsert(PoolKeyOf(collection), itemId);
                     }
 
                     return (existing.DeepClone(), HttpStatusCode.OK);
@@ -1633,6 +1650,9 @@ public sealed partial class GraphMockEngine
         _pendingHeaders = null;
         var (responseBody, statusCode) = node.IsRef
             ? (node.RelationKey is not null ? HandleRelationRef(registry, node, method, request, versionSegment) : HandleRef(node, method, request))
+            : node.Operation is { IsAction: false } op && node.IsCollection && node.RelationKey is null && method == "GET"
+                && string.Equals(op.Name, "delta", StringComparison.OrdinalIgnoreCase)
+                ? HandleDelta(registry, versionSegment, node, request)
             : node.Operation is not null
                 ? (node.Operation.IsAction ? HandleAction(registry, node.Operation, method, request) : HandleFunction(registry, node.Operation, method, request))
                 : node.IsCollection
