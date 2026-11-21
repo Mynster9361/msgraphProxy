@@ -201,7 +201,7 @@ public sealed partial class GraphMockEngine
 
     private static readonly Dictionary<string, Func<string>> NameFakes = new(StringComparer.Ordinal)
     {
-        ["id"] = () => Guid.NewGuid().ToString(),
+        ["id"] = () => MockAmbient.NewGuid("prop:id").ToString(),
         ["givenName"] = () => "Test",
         ["surname"] = () => "User",
         ["userPrincipalName"] = () => "testuser@contoso.com",
@@ -237,6 +237,8 @@ public sealed partial class GraphMockEngine
     private readonly Lock _gate = new();
 
     private readonly GraphMockPagingOptions _paging;
+    private readonly GraphMockDeterminismOptions _determinism;
+    private readonly MockEntropy _entropy;
 
     // Snapshot-mode result sets, keyed by the id inside the $skiptoken. Bounded: the oldest are evicted,
     // and a token pointing at an evicted snapshot gets the same 400 an expired real token does.
@@ -253,14 +255,26 @@ public sealed partial class GraphMockEngine
     /// <param name="betaCsdl">Contents of the beta CSDL, or null to leave /beta/* unmocked.</param>
     /// <param name="subscribedSkus">Seeds the subscribedSkus pool instead of generic fabrication, when non-empty.</param>
     /// <param name="paging">Page sizes and $skiptoken consistency; defaults match Graph's directory APIs.</param>
-    public GraphMockEngine(string v1Csdl, string? betaCsdl = null, IEnumerable<GraphSchemaMockSubscribedSkuConfiguration>? subscribedSkus = null, GraphMockPagingOptions? paging = null)
+    /// <param name="determinism">Seed, fixed clock and pool sizes; defaults keep the historical random behavior.</param>
+    public GraphMockEngine(
+        string v1Csdl,
+        string? betaCsdl = null,
+        IEnumerable<GraphSchemaMockSubscribedSkuConfiguration>? subscribedSkus = null,
+        GraphMockPagingOptions? paging = null,
+        GraphMockDeterminismOptions? determinism = null)
     {
         ArgumentNullException.ThrowIfNull(v1Csdl);
         _paging = paging ?? new GraphMockPagingOptions();
+        _determinism = determinism ?? new GraphMockDeterminismOptions();
+        _entropy = new MockEntropy(_determinism.Seed);
+        Clock = new MockClock(_determinism.FixedNow);
         _v1Registry = ParseSchema(v1Csdl);
         _betaRegistry = betaCsdl is null ? null : ParseSchema(betaCsdl);
         _subscribedSkus = subscribedSkus?.ToList() ?? [];
     }
+
+    /// <summary>The engine's clock: real time, or a fixed "now" that only moves when advanced.</summary>
+    public MockClock Clock { get; }
 
     /// <summary>Entity types, enums, entity sets and singletons parsed for a version, for host logging.</summary>
     public SchemaStats GetSchemaStats(string version)
@@ -282,6 +296,7 @@ public sealed partial class GraphMockEngine
 
         lock (_gate)
         {
+            using var ambient = MockAmbient.Enter(_entropy, Clock);
             return HandleCore(method, request);
         }
     }
@@ -290,10 +305,19 @@ public sealed partial class GraphMockEngine
     /// The response strict mode sends instead of forwarding a request the engine didn't handle,
     /// so nothing ever reaches the real service. Shapes match what $batch sub-requests already get.
     /// </summary>
-    public static MockResponse StrictResponse(MockSkipReason reason, MockRequest request)
+    public MockResponse StrictResponse(MockSkipReason reason, MockRequest request)
     {
         ArgumentNullException.ThrowIfNull(request);
 
+        lock (_gate)
+        {
+            using var ambient = MockAmbient.Enter(_entropy, Clock);
+            return BuildStrictResponse(reason, request);
+        }
+    }
+
+    private static MockResponse BuildStrictResponse(MockSkipReason reason, MockRequest request)
+    {
         var result = reason is MockSkipReason.UnsupportedMethod or MockSkipReason.MethodNotSupportedForResource
             ? new MockResult(ODataError("Request_BadRequest", "Specified HTTP method is not allowed for the request target."), HttpStatusCode.MethodNotAllowed, LogLabel: $"strict: {reason}")
             : new MockResult(ODataError("Request_ResourceNotFound", $"Resource not found for the segment '{request.RequestUri.AbsolutePath}'."), HttpStatusCode.NotFound, LogLabel: $"strict: {reason}");
@@ -720,7 +744,7 @@ public sealed partial class GraphMockEngine
 
             if (!created.TryGetPropertyValue("id", out var idNode) || idNode is null)
             {
-                created["id"] = Guid.NewGuid().ToString();
+                created["id"] = MockAmbient.NewGuid("post:" + typeFullName).ToString();
             }
 
             pool.Add(created);
@@ -797,7 +821,7 @@ public sealed partial class GraphMockEngine
             results = [.. filtered];
             if (_paging.Consistency == GraphMockPagingConsistency.Snapshot && results.Count > pageSize)
             {
-                snapshotId = Guid.NewGuid().ToString("N");
+                snapshotId = MockAmbient.NewGuid("snapshot").ToString("N");
                 _snapshots[snapshotId] = results;
                 _snapshotOrder.Enqueue(snapshotId);
                 while (_snapshotOrder.Count > MaxSnapshots)
@@ -1070,7 +1094,7 @@ public sealed partial class GraphMockEngine
 
     // Bound Functions/Actions don't model their parameters, so request bodies and
     // parenthesized arguments are ignored - only the ReturnType shape is fabricated.
-    private static (JsonNode? Body, HttpStatusCode? StatusCode) HandleFunction(SchemaRegistry registry, FunctionActionDef op, string method, MockRequest request)
+    private (JsonNode? Body, HttpStatusCode? StatusCode) HandleFunction(SchemaRegistry registry, FunctionActionDef op, string method, MockRequest request)
     {
         if (method != "GET")
         {
@@ -1080,7 +1104,7 @@ public sealed partial class GraphMockEngine
         return BuildOperationResult(registry, op.ReturnType);
     }
 
-    private static (JsonNode? Body, HttpStatusCode? StatusCode) HandleAction(SchemaRegistry registry, FunctionActionDef op, string method, MockRequest request)
+    private (JsonNode? Body, HttpStatusCode? StatusCode) HandleAction(SchemaRegistry registry, FunctionActionDef op, string method, MockRequest request)
     {
         if (method != "POST")
         {
@@ -1090,11 +1114,26 @@ public sealed partial class GraphMockEngine
         return BuildOperationResult(registry, op.ReturnType);
     }
 
-    private static (JsonNode? Body, HttpStatusCode? StatusCode) BuildOperationResult(SchemaRegistry registry, string? returnType)
+    private (JsonNode? Body, HttpStatusCode? StatusCode) BuildOperationResult(SchemaRegistry registry, string? returnType)
     {
         if (returnType is null)
         {
             return (null, HttpStatusCode.NoContent);
+        }
+
+        // Functions returning entities (delta(), getAllSites(), ...) are served from the pools, so the
+        // ids they return resolve on a follow-up GET, like real Graph.
+        var elementType = StripCollection(returnType);
+        if (!elementType.StartsWith("Edm.", StringComparison.Ordinal))
+        {
+            var entityType = ResolveRefName(registry, elementType);
+            if (IsEntityLike(registry, entityType))
+            {
+                var pool = GetOrSeedPool(registry, entityType);
+                return IsCollectionType(returnType)
+                    ? (new JsonObject { ["value"] = new JsonArray([.. pool.Select(item => (JsonNode)item.DeepClone())]) }, HttpStatusCode.OK)
+                    : (pool[0].DeepClone(), HttpStatusCode.OK);
+            }
         }
 
         var value = BuildValue(registry, returnType, "value", 1);
@@ -1195,7 +1234,7 @@ public sealed partial class GraphMockEngine
         }
 
         // Mirrors Dev Proxy v3's ProxyUtils.BuildGraphResponseHeaders, so the adapter's output is unchanged.
-        var requestId = Guid.NewGuid().ToString();
+        var requestId = MockAmbient.NewGuid("request").ToString();
         var headers = new List<KeyValuePair<string, string>>
         {
             new("Cache-Control", "no-store"),
@@ -1203,7 +1242,7 @@ public sealed partial class GraphMockEngine
             new("Strict-Transport-Security", ""),
             new("request-id", requestId),
             new("client-request-id", requestId),
-            new("Date", DateTime.Now.ToString("r", CultureInfo.InvariantCulture)),
+            new("Date", MockAmbient.UtcNow.ToString("r", CultureInfo.InvariantCulture)),
             new("Content-Type", "application/json"),
         };
         if (result.ExtraHeaders is not null)
@@ -1236,17 +1275,73 @@ public sealed partial class GraphMockEngine
 
         var seeded = string.Equals(typeFullName, "microsoft.graph.subscribedSku", StringComparison.Ordinal) && _subscribedSkus.Count > 0
             ? SeedSubscribedSkuPool(registry, _subscribedSkus)
-            : SeedGenericPool(registry, typeFullName);
+            : SeedGenericPool(registry, typeFullName, _determinism.PoolSizeFor(typeFullName));
+
+        // Name-based ids: with a seed, record i of type T is always uuid(seed, T, i), regardless of
+        // which types were touched first. subscribedSku ids are composite and keep their own scheme.
+        if (_entropy.IsSeeded && !string.Equals(typeFullName, "microsoft.graph.subscribedSku", StringComparison.Ordinal))
+        {
+            for (var i = 0; i < seeded.Count; i++)
+            {
+                if (seeded[i].ContainsKey("id"))
+                {
+                    seeded[i]["id"] = _entropy.Named("id:" + typeFullName + "#" + i.ToString(CultureInfo.InvariantCulture)).ToString();
+                }
+            }
+        }
 
         var created = new EntityPool(seeded);
         _store[typeFullName] = created;
         return created;
     }
 
-    private static List<JsonObject> SeedGenericPool(SchemaRegistry registry, string typeFullName)
+    private static List<JsonObject> SeedGenericPool(SchemaRegistry registry, string typeFullName, int count)
     {
         var first = BuildEntity(registry, typeFullName);
-        return [first, SecondSample(first, typeFullName)];
+        var pool = new List<JsonObject>(count) { first };
+        if (count >= 2)
+        {
+            pool.Add(SecondSample(first, typeFullName));
+        }
+
+        for (var i = 2; i < count; i++)
+        {
+            pool.Add(NthSample(first, typeFullName, i));
+        }
+
+        return pool;
+    }
+
+    // Records 3..N for larger pools: same shape as the first, distinct id and names.
+    private static JsonObject NthSample(JsonObject source, string fullName, int index)
+    {
+        var clone = source.DeepClone().AsObject();
+        var n = (index + 1).ToString(CultureInfo.InvariantCulture);
+        if (clone.ContainsKey("id"))
+        {
+            clone["id"] = MockAmbient.NewGuid("prop:id").ToString();
+        }
+
+        if (string.Equals(fullName, "microsoft.graph.user", StringComparison.Ordinal))
+        {
+            if (clone.ContainsKey("displayName")) clone["displayName"] = "User " + n;
+            if (clone.ContainsKey("givenName")) clone["givenName"] = "User";
+            if (clone.ContainsKey("surname")) clone["surname"] = n;
+            if (clone.ContainsKey("userPrincipalName")) clone["userPrincipalName"] = "user" + n + "@contoso.com";
+            if (clone.ContainsKey("mail")) clone["mail"] = "user" + n + "@contoso.com";
+            if (clone.ContainsKey("mailNickname")) clone["mailNickname"] = "user" + n;
+            return clone;
+        }
+
+        foreach (var key in new[] { "displayName", "name" })
+        {
+            if (clone[key] is JsonValue value && value.TryGetValue(out string? text))
+            {
+                clone[key] = text + " " + n;
+            }
+        }
+
+        return clone;
     }
 
     // Real Graph shares one accountId/accountName across every subscribedSku
@@ -1255,7 +1350,7 @@ public sealed partial class GraphMockEngine
     // subscribedSkus response.
     private static List<JsonObject> SeedSubscribedSkuPool(SchemaRegistry registry, IEnumerable<GraphSchemaMockSubscribedSkuConfiguration> skus)
     {
-        var accountId = Guid.NewGuid().ToString();
+        var accountId = MockAmbient.NewGuid("sku:account").ToString();
         const string accountName = "contoso";
         return [.. skus.Select(sku => BuildSubscribedSku(registry, sku, accountId, accountName))];
     }
@@ -1263,7 +1358,7 @@ public sealed partial class GraphMockEngine
     private static JsonObject BuildSubscribedSku(SchemaRegistry registry, GraphSchemaMockSubscribedSkuConfiguration sku, string accountId, string accountName)
     {
         var entity = BuildEntity(registry, "microsoft.graph.subscribedSku");
-        var skuId = Guid.NewGuid().ToString();
+        var skuId = MockAmbient.NewGuid("sku:id").ToString();
         entity["id"] = $"{accountId}_{skuId}";
         entity["accountId"] = accountId;
         entity["accountName"] = accountName;
@@ -1279,7 +1374,7 @@ public sealed partial class GraphMockEngine
             ["warning"] = 0,
             ["lockedOut"] = 0,
         };
-        entity["subscriptionIds"] = new JsonArray(Guid.NewGuid().ToString());
+        entity["subscriptionIds"] = new JsonArray(MockAmbient.NewGuid("sku:subscription").ToString());
 
         var servicePlans = new JsonArray();
         foreach (var plan in sku.ServicePlans)
@@ -1509,9 +1604,9 @@ public sealed partial class GraphMockEngine
             "Edm.Boolean" => true,
             "Edm.Int16" or "Edm.Int32" or "Edm.Int64" or "Edm.Byte" or "Edm.SByte" => 1,
             "Edm.Double" or "Edm.Single" or "Edm.Decimal" => 1.0,
-            "Edm.Guid" => Guid.NewGuid().ToString(),
-            "Edm.DateTimeOffset" => DateTimeOffset.UtcNow.ToString("o", CultureInfo.InvariantCulture),
-            "Edm.Date" => DateTimeOffset.UtcNow.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+            "Edm.Guid" => MockAmbient.NewGuid("prop:" + propName).ToString(),
+            "Edm.DateTimeOffset" => MockAmbient.UtcNow.ToString("o", CultureInfo.InvariantCulture),
+            "Edm.Date" => MockAmbient.UtcNow.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
             "Edm.TimeOfDay" => "12:00:00.0000000",
             "Edm.Duration" => "PT1H",
             "Edm.Binary" => "U2FtcGxlIGJpbmFyeSBkYXRh",
@@ -1525,7 +1620,7 @@ public sealed partial class GraphMockEngine
         var clone = source.DeepClone().AsObject();
         if (clone.ContainsKey("id"))
         {
-            clone["id"] = Guid.NewGuid().ToString();
+            clone["id"] = MockAmbient.NewGuid("prop:id").ToString();
         }
 
         if (string.Equals(fullName, "microsoft.graph.user", StringComparison.Ordinal))
@@ -1673,7 +1768,7 @@ public sealed partial class GraphMockEngine
     // after TrimTo, mutating the trimmed object: otherwise an expanded property
     // absent from $select/DefaultProps would immediately be stripped back out,
     // whereas real Graph always surfaces an expanded property regardless of $select.
-    private static void ApplyExpand(SchemaRegistry registry, JsonObject target, string typeFullName, MockRequest request)
+    private void ApplyExpand(SchemaRegistry registry, JsonObject target, string typeFullName, MockRequest request)
     {
         var query = System.Web.HttpUtility.ParseQueryString(request.RequestUri.Query);
         var expandParam = query["$expand"];
@@ -1705,10 +1800,56 @@ public sealed partial class GraphMockEngine
             // wrong can't change which records match.
             if (match is not null)
             {
-                target[match.Value.Name] = BuildValue(registry, match.Value.Type, match.Value.Name, 1);
+                target[match.Value.Name] = ExpandFromPool(registry, target, match.Value.Name, match.Value.Type)
+                    ?? BuildValue(registry, match.Value.Type, match.Value.Name, 1);
             }
         }
     }
+
+    // Expanded entities come from the target type's pool (cloned), so an expanded manager or
+    // member is a real, GET-able record. A to-one pick is stable per (parent id, navigation).
+    // Per-parent relationship data is P1 #9/#10; until then every parent sees the same members.
+    private const int MaxExpandedItems = 20;
+
+    private JsonNode? ExpandFromPool(SchemaRegistry registry, JsonObject target, string navName, string navType)
+    {
+        var entityType = ResolveRefName(registry, StripCollection(navType));
+        if (!IsEntityLike(registry, entityType))
+        {
+            return null;
+        }
+
+        var pool = GetOrSeedPool(registry, entityType);
+        if (IsCollectionType(navType))
+        {
+            return new JsonArray([.. pool.Take(MaxExpandedItems).Select(item => (JsonNode)item.DeepClone())]);
+        }
+
+        var parentId = target["id"] is JsonValue idValue && idValue.TryGetValue(out string? id) ? id : "";
+        var index = (int)(StableHash(parentId + "/" + navName) % (uint)pool.Count);
+        if (pool.Count > 1 && pool[index]["id"] is JsonValue picked && picked.TryGetValue(out string? pickedId) && pickedId == parentId)
+        {
+            index = (index + 1) % pool.Count; // a user is not their own manager
+        }
+
+        return pool[index].DeepClone();
+    }
+
+    // string.GetHashCode is randomized per process; this must be stable across runs.
+    private static uint StableHash(string text)
+    {
+        var hash = 2166136261u;
+        foreach (var c in text)
+        {
+            hash = (hash ^ c) * 16777619u;
+        }
+
+        return hash;
+    }
+
+    private static bool IsEntityLike(SchemaRegistry registry, string fullName) =>
+        registry.Types.ContainsKey(fullName) &&
+        GetAllProperties(registry, fullName).Exists(p => string.Equals(p.Name, "id", StringComparison.Ordinal));
 
     // --- $orderby ---
 

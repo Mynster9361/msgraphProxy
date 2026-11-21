@@ -27,7 +27,7 @@ public sealed class GraphMockHttpMessageHandler(GraphMockEngine engine) : HttpMe
 
         // The engine is thread-safe, and the handler is always strict: nothing is ever forwarded.
         var outcome = engine.Handle(request.Method.Method, mockRequest);
-        var response = outcome.Response ?? GraphMockEngine.StrictResponse(outcome.SkipReason!.Value, mockRequest);
+        var response = outcome.Response ?? engine.StrictResponse(outcome.SkipReason!.Value, mockRequest);
 
         var message = new HttpResponseMessage((HttpStatusCode)response.StatusCode)
         {

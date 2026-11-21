@@ -32,6 +32,9 @@ public sealed class GraphSchemaMockPluginConfiguration
     // Page sizes ($top / Prefer: odata.maxpagesize / defaults, per type) and $skiptoken consistency
     // ("Snapshot" freezes the result set on page 1, "Offset" re-evaluates every page).
     public GraphMockPagingOptions Paging { get; set; } = new();
+    // Reproducibility: seed (same seed + same requests = byte-identical responses), fixedNow,
+    // defaultPoolSize and per-type poolSizes. Without a seed, ids stay random as before.
+    public GraphMockDeterminismOptions Determinism { get; set; } = new();
 }
 
 /// <summary>
@@ -88,7 +91,7 @@ public sealed class GraphSchemaMockPlugin(
             }
         }
 
-        _engine = new GraphMockEngine(v1Csdl, betaCsdl, Configuration.SubscribedSkus, Configuration.Paging);
+        _engine = new GraphMockEngine(v1Csdl, betaCsdl, Configuration.SubscribedSkus, Configuration.Paging, Configuration.Determinism);
         _graphHosts = new GraphHosts(Configuration.AdditionalGraphHosts);
         LogRegistryLoaded("v1.0", schemaFilePath);
         if (betaCsdl is not null)
@@ -148,7 +151,7 @@ public sealed class GraphSchemaMockPlugin(
         {
             if (Configuration.Strict)
             {
-                response = GraphMockEngine.StrictResponse(outcome.SkipReason!.Value, request);
+                response = _engine.StrictResponse(outcome.SkipReason!.Value, request);
             }
             else
             {

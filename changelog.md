@@ -9,6 +9,9 @@
 + Fix: the mock engine is now thread-safe. Dev Proxy runs plugins concurrently, and parallel writes could be lost. Lookups by id now use an index instead of a linear scan.
 + Add: `graphSchemaMockPlugin.strict` returns a 404/405 Graph error for anything the mock can't answer instead of forwarding it to the real service. Off by default.
 + Add: paging for collection GETs. Supports `$top`, `Prefer: odata.maxpagesize` (acknowledged with `Preference-Applied`), an opaque `$skiptoken` and `@odata.nextLink`, which keeps the other query options. The defaults match Graph's directory APIs: 100 per page and at most 999; `$top` outside that range gets Graph's 400. `@odata.count` is now the total, not the page size. Configure it with `graphSchemaMockPlugin.paging`: `defaultPageSize`, `maxPageSize`, per-type `pageSizes`, and `consistency` (`Snapshot`, the default, freezes the result set on page 1; `Offset` re-evaluates every page).
++ Add: reproducible mocks through `graphSchemaMockPlugin.determinism`. With a `seed`, the same requests give byte-identical responses: ids are name-based (record *i* of a type is always the same id), and generated GUIDs, request-ids and `$skiptoken`s follow the seed. `fixedNow` pins the clock for generated dates and the `Date` header. `defaultPoolSize` and per-type `poolSizes` (for example 500 users) set how many records are seeded.
++ Change: entity results of functions (`delta()`, `getAllSites()`, ...) and `$expand`ed navigation properties now come from the type's pool, so their ids resolve on a follow-up GET. Before, they were fresh, unresolvable fabrications.
++ Fix: the `Date` response header was local time labeled as GMT. It is now UTC.
 + Change: collections with more than 100 items now return 100 per page with a nextLink, like Graph. Before, they returned everything at once.
 + Add: `graphSchemaMockPlugin.additionalGraphHosts` for extra Graph hosts, such as sovereign clouds. They must also be listed in `urlsToWatch`.
 
