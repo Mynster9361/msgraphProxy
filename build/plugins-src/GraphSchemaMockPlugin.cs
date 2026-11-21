@@ -38,6 +38,10 @@ public sealed class GraphSchemaMockPluginConfiguration
     // Unknown $select names get Graph's 400. Set false for clients that select properties this CSDL
     // doesn't declare.
     public bool ValidateSelect { get; set; } = true;
+    // Fault injection and throttling: rules (path glob, method, query, header, direct/batch -> status,
+    // Retry-After, probability, everyNth, maxHits, latencyMs), token buckets per workload/app/mailbox,
+    // and mailboxConcurrencyLimit (Graph's is 4). Off unless configured.
+    public GraphMockFaultOptions Faults { get; set; } = new();
 }
 
 /// <summary>
@@ -94,7 +98,7 @@ public sealed class GraphSchemaMockPlugin(
             }
         }
 
-        _engine = new GraphMockEngine(v1Csdl, betaCsdl, Configuration.SubscribedSkus, Configuration.Paging, Configuration.Determinism)
+        _engine = new GraphMockEngine(v1Csdl, betaCsdl, Configuration.SubscribedSkus, Configuration.Paging, Configuration.Determinism, Configuration.Faults)
         {
             ValidateSelectEnabled = Configuration.ValidateSelect,
         };
@@ -125,25 +129,25 @@ public sealed class GraphSchemaMockPlugin(
             schemaFilePath);
     }
 
-    public override Task BeforeRequestAsync(ProxyRequestArgs e, CancellationToken cancellationToken)
+    public override async Task BeforeRequestAsync(ProxyRequestArgs e, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(e);
 
         if (_engine is null || !e.ShouldExecute(UrlsToWatch))
         {
-            return Task.CompletedTask;
+            return;
         }
 
         var rawRequest = e.Session.HttpClient.Request;
         if (!_graphHosts.IsGraphUrl(rawRequest.RequestUri))
         {
-            return Task.CompletedTask;
+            return;
         }
 
         var method = rawRequest.Method?.ToUpperInvariant() ?? "";
         if (method is not ("GET" or "POST" or "PATCH" or "PUT" or "DELETE") && !Configuration.Strict)
         {
-            return Task.CompletedTask;
+            return;
         }
 
         var request = new MockRequest(
@@ -151,7 +155,7 @@ public sealed class GraphSchemaMockPlugin(
             name => rawRequest.Headers.GetFirstHeader(name)?.Value,
             rawRequest.HasBody ? rawRequest.BodyString : null);
 
-        var outcome = _engine.Handle(method, request);
+        var outcome = await _engine.HandleAsync(method, request, cancellationToken);
         var response = outcome.Response;
         if (response is null)
         {
@@ -166,7 +170,7 @@ public sealed class GraphSchemaMockPlugin(
                     Logger.LogRequest("No schema match for this path", MessageType.Skipped, new LoggingContext(e.Session));
                 }
 
-                return Task.CompletedTask;
+                return;
             }
         }
 
@@ -176,7 +180,5 @@ public sealed class GraphSchemaMockPlugin(
             response.Headers.Select(h => new HttpHeader(h.Key, h.Value)));
         e.ResponseState.HasBeenSet = true;
         Logger.LogRequest($"{response.StatusCode} schema mock ({response.LogLabel})", MessageType.Mocked, new LoggingContext(e.Session));
-
-        return Task.CompletedTask;
     }
 }

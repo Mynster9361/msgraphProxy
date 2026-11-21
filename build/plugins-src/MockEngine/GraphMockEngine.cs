@@ -241,6 +241,7 @@ public sealed partial class GraphMockEngine
     private readonly GraphMockPagingOptions _paging;
     private readonly GraphMockDeterminismOptions _determinism;
     private readonly MockEntropy _entropy;
+    private readonly FaultGate _faults;
 
     // Snapshot-mode result sets, keyed by the id inside the $skiptoken. Bounded: the oldest are evicted,
     // and a token pointing at an evicted snapshot gets the same 400 an expired real token does.
@@ -263,13 +264,15 @@ public sealed partial class GraphMockEngine
         string? betaCsdl = null,
         IEnumerable<GraphSchemaMockSubscribedSkuConfiguration>? subscribedSkus = null,
         GraphMockPagingOptions? paging = null,
-        GraphMockDeterminismOptions? determinism = null)
+        GraphMockDeterminismOptions? determinism = null,
+        GraphMockFaultOptions? faults = null)
     {
         ArgumentNullException.ThrowIfNull(v1Csdl);
         _paging = paging ?? new GraphMockPagingOptions();
         _determinism = determinism ?? new GraphMockDeterminismOptions();
         _entropy = new MockEntropy(_determinism.Seed);
         Clock = new MockClock(_determinism.FixedNow);
+        _faults = new FaultGate(faults ?? new GraphMockFaultOptions(), Clock);
         _v1Registry = ParseSchema(v1Csdl);
         _betaRegistry = betaCsdl is null ? null : ParseSchema(betaCsdl);
         _subscribedSkus = subscribedSkus?.ToList() ?? [];
@@ -302,12 +305,101 @@ public sealed partial class GraphMockEngine
         ArgumentNullException.ThrowIfNull(method);
         ArgumentNullException.ThrowIfNull(request);
 
-        lock (_gate)
+        var mailbox = FaultGate.MailboxKeyFor(RelativePath(request.RequestUri));
+        _faults.Enter(mailbox);
+        try
         {
-            using var ambient = MockAmbient.Enter(_entropy, Clock);
-            return HandleCore(method, request);
+            lock (_gate)
+            {
+                using var ambient = MockAmbient.Enter(_entropy, Clock);
+                return HandleCore(method, request);
+            }
+        }
+        finally
+        {
+            _faults.Exit(mailbox);
         }
     }
+
+    /// <summary>
+    /// Like <see cref="Handle"/>, plus the latency of matching fault rules. The request counts as in flight
+    /// (for the mailbox concurrency limit) from arrival until it completes, including that delay.
+    /// </summary>
+    public async Task<MockOutcome> HandleAsync(string method, MockRequest request, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(method);
+        ArgumentNullException.ThrowIfNull(request);
+
+        var relativePath = RelativePath(request.RequestUri);
+        var mailbox = FaultGate.MailboxKeyFor(relativePath);
+        _faults.Enter(mailbox);
+        try
+        {
+            int latency;
+            lock (_gate)
+            {
+                latency = _faults.HasRules ? _faults.LatencyFor(method.ToUpperInvariant(), relativePath, request.RequestUri.Query, request.GetHeader) : 0;
+            }
+
+            if (latency > 0)
+            {
+                await Task.Delay(latency, cancellationToken).ConfigureAwait(false);
+            }
+
+            lock (_gate)
+            {
+                using var ambient = MockAmbient.Enter(_entropy, Clock);
+                return HandleCore(method, request);
+            }
+        }
+        finally
+        {
+            _faults.Exit(mailbox);
+        }
+    }
+
+    /// <summary>Requests served, non-GETs, 429s, injected faults and Retry-After violations so far.</summary>
+    public MockStats GetStats()
+    {
+        lock (_gate)
+        {
+            return _faults.Stats();
+        }
+    }
+
+    /// <summary>Clears fault/throttle state and counters (buckets refill, Retry-After blocks lift).</summary>
+    public void ResetFaults()
+    {
+        lock (_gate)
+        {
+            _faults.Reset();
+        }
+    }
+
+    // "/users/x/messages" for ".../v1.0/users/x/messages"; the full path when there is no version segment.
+    private static string RelativePath(Uri uri)
+    {
+        var path = uri.AbsolutePath;
+        foreach (var version in new[] { V1VersionSegment, BetaVersionSegment })
+        {
+            var index = path.IndexOf(version, StringComparison.OrdinalIgnoreCase);
+            if (index >= 0)
+            {
+                return "/" + path[(index + version.Length)..].Trim('/');
+            }
+        }
+
+        return path;
+    }
+
+    private static MockResult FaultResult(FaultDecision fault) => new(
+        ODataError(fault.Code, fault.Message),
+        (HttpStatusCode)fault.Status,
+        LogLabel: "fault: " + fault.Code,
+        ExtraHeaders: fault.RetryAfterSeconds is { } retry ? [new("Retry-After", retry.ToString(CultureInfo.InvariantCulture))] : null);
+
+    private static MockResponse WithHeaders(MockResponse response, IReadOnlyList<KeyValuePair<string, string>>? extra) =>
+        extra is null || extra.Count == 0 ? response : response with { Headers = [.. response.Headers, .. extra] };
 
     /// <summary>
     /// The response strict mode sends instead of forwarding a request the engine didn't handle,
@@ -351,6 +443,14 @@ public sealed partial class GraphMockEngine
         // https://learn.microsoft.com/graph/json-batching - never routed
         // through the normal EntitySet/Singleton resolution below.
         var remainder = path[(path.IndexOf(versionSegment, StringComparison.OrdinalIgnoreCase) + versionSegment.Length)..].Trim('/');
+
+        // Fault injection and throttling (P0 #7) run before anything else, like a real front door.
+        var fault = _faults.Evaluate(method, "/" + remainder, request.RequestUri.Query, request.GetHeader, inBatch: false, out var throttleWarnings);
+        if (fault is not null)
+        {
+            return MockOutcome.Respond(ToResponse(FaultResult(fault), request));
+        }
+
         if (method == "POST" && string.Equals(remainder, "$batch", StringComparison.OrdinalIgnoreCase))
         {
             return MockOutcome.Respond(ToResponse(HandleBatch(registry, versionSegment, request), request));
@@ -368,7 +468,7 @@ public sealed partial class GraphMockEngine
             return MockOutcome.NotHandled(MockSkipReason.MethodNotSupportedForResource);
         }
 
-        return MockOutcome.Respond(ToResponse(result.Value, request));
+        return MockOutcome.Respond(WithHeaders(ToResponse(result.Value, request), throttleWarnings));
     }
 
     // v1.0 is checked first so a path containing both segments (never happens in
@@ -456,6 +556,11 @@ public sealed partial class GraphMockEngine
         // so what actually matters observably is honoring dependsOn
         // ordering and propagating 424 (Failed Dependency) when a
         // dependency didn't succeed, both of which this loop does.
+        // Graph runs a batch without dependsOn in parallel, so its same-mailbox sub-requests count
+        // toward the mailbox concurrency limit together.
+        _faults.BeginBatch(parallel: subRequests.TrueForAll(r => r.DependsOn.Count == 0));
+        try
+        {
         while (pending.Count > 0)
         {
             var progressed = false;
@@ -470,7 +575,7 @@ public sealed partial class GraphMockEngine
                 var failedDependency = sub.DependsOn.FirstOrDefault(d => results[d].Status >= 400);
                 results[sub.Id] = failedDependency is not null
                     ? SubResponse.Json(424, ODataError("Request_Dependency", $"Request depends on '{failedDependency}', which failed."))
-                    : ProcessBatchSubRequest(registry, versionSegment, request.RequestUri, sub.Method, sub.Url, sub.Headers, sub.Body);
+                    : ProcessBatchSubRequest(registry, versionSegment, request, sub.Method, sub.Url, sub.Headers, sub.Body);
 
                 pending.RemoveAt(i);
                 progressed = true;
@@ -487,6 +592,11 @@ public sealed partial class GraphMockEngine
 
                 break;
             }
+        }
+        }
+        finally
+        {
+            _faults.EndBatch();
         }
 
         // Real Graph doesn't guarantee response order matches request order
@@ -541,8 +651,9 @@ public sealed partial class GraphMockEngine
         }
     }
 
-    private SubResponse ProcessBatchSubRequest(SchemaRegistry registry, string versionSegment, Uri batchUri, string method, string url, JsonObject? headers, string? body)
+    private SubResponse ProcessBatchSubRequest(SchemaRegistry registry, string versionSegment, MockRequest batchRequest, string method, string url, JsonObject? headers, string? body)
     {
+        var batchUri = batchRequest.RequestUri;
         // Sub-request urls must be relative to the $batch endpoint (e.g. "/me/memberOf" or
         // "users?$select=..."). An absolute url is rejected for that sub-request rather than silently
         // re-rooted, which would hide a client bug.
@@ -559,6 +670,18 @@ public sealed partial class GraphMockEngine
         var query = queryIdx >= 0 ? url[queryIdx..] : "";
         var path = (queryIdx >= 0 ? url[..queryIdx] : url).TrimStart('/');
         var absoluteUri = new Uri($"{batchUri.Scheme}://{batchUri.Authority}{versionSegment}{path}{query}");
+
+        // Sub-requests inherit the batch's Authorization (they never carry their own), so per-app
+        // throttle buckets see the same caller either way.
+        string? SubHeader(string name) =>
+            GetJsonHeader(headers, name) ?? (string.Equals(name, "Authorization", StringComparison.OrdinalIgnoreCase) ? batchRequest.GetHeader(name) : null);
+
+        var subFault = _faults.Evaluate(method, "/" + path, query, SubHeader, inBatch: true, out var subWarnings);
+        if (subFault is not null)
+        {
+            var faultResult = FaultResult(subFault);
+            return SubResponse.Json(subFault.Status, faultResult.Body, faultResult.ExtraHeaders);
+        }
 
         var subRequest = new MockRequest(absoluteUri, name => GetJsonHeader(headers, name), body);
 
@@ -582,7 +705,10 @@ public sealed partial class GraphMockEngine
             return new SubResponse(status, JsonValue.Create(result.Value.RawText), textHeaders);
         }
 
-        return SubResponse.Json(status, result.Value.Body, result.Value.ExtraHeaders);
+        var extra = result.Value.ExtraHeaders is null && subWarnings is null
+            ? null
+            : (IReadOnlyList<KeyValuePair<string, string>>)[.. result.Value.ExtraHeaders ?? [], .. subWarnings ?? []];
+        return SubResponse.Json(status, result.Value.Body, extra);
     }
 
     private static string? GetJsonHeader(JsonObject? headers, string name)

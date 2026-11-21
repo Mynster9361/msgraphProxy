@@ -16,6 +16,12 @@
 + Fix: `$batch` sub-requests used a hard-coded `graph.microsoft.com`, so nextLinks and `@odata.context` inside a US Gov, DoD or China batch pointed at the wrong cloud. They now use the host the batch was sent to.
 + Change: an absolute URL in a `$batch` sub-request now gets its own 400 instead of being quietly re-rooted.
 + Change: `$select` with an unknown property now gets Graph's 400 (`Could not find a property named 'x' on type 'T'.`). Properties of the type, its base types and its derived types are accepted, so polymorphic collections like `members` still work. Matching is case-insensitive, and `*` and `extension_*` names are always allowed. Set `graphSchemaMockPlugin.validateSelect` to `false` for clients that select properties this CSDL doesn't declare.
++ Add: fault injection and throttling through `graphSchemaMockPlugin.faults`. Everything is off until configured.
+  + `rules`: match by path glob (`*` is one segment, `**` is any), method, query text, header, and `DirectOnly`/`BatchOnly`. Each rule returns a status with an optional `Retry-After`, `probability` (drawn from the seed when set), `everyNth`, `maxHits`, or pure `latencyMs`.
+  + `mailboxConcurrencyLimit` (Graph's is 4): more concurrent requests to one mailbox get 429 `ApplicationThrottled`. Parallel `$batch` sub-requests to the same mailbox count together.
+  + `buckets`: token buckets per workload, `Global`, `App` or `Mailbox`. Responses carry `x-ms-throttle-limit-percentage` once a bucket is at least 80% used.
+  + `Retry-After` is enforced: retrying early gets another 429 and counts as a violation. All timing follows the engine clock, so with `fixedNow` the clock has to be advanced.
+  + The engine exposes stats (requests, `$batch` sub-requests, non-GET requests, 429s served, faults per rule, `Retry-After` violations) for the upcoming control endpoint.
 + Change: collections with more than 100 items now return 100 per page with a nextLink, like Graph. Before, they returned everything at once.
 + Add: `graphSchemaMockPlugin.additionalGraphHosts` for extra Graph hosts, such as sovereign clouds. They must also be listed in `urlsToWatch`.
 
