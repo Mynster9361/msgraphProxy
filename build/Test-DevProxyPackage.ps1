@@ -150,14 +150,42 @@ try {
 
     # Dev Proxy invokes plugins concurrently; the engine's shared pools must survive parallel writes.
     Test-Check 'parallel POST /groups are all stored (thread safety)' {
-        $before = (Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/groups' -Headers $headers -SkipCertificateCheck -TimeoutSec 15).value.Count
+        # $top=999: collections are paged (100 by default), and this counts the whole pool.
+        $before = (Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/groups?$top=999' -Headers $headers -SkipCertificateCheck -TimeoutSec 15).value.Count
         $created = 1..24 | ForEach-Object -ThrottleLimit 12 -Parallel {
             $body = @{ displayName = "parallel-$_"; mailNickname = "parallel$_" } | ConvertTo-Json
             (Invoke-RestMethod -Method Post -Uri 'https://graph.microsoft.com/v1.0/groups' -Headers $using:headers -Body $body -ContentType 'application/json' -SkipCertificateCheck -TimeoutSec 30).id
         }
         if (@($created | Select-Object -Unique).Count -ne 24) { throw "expected 24 distinct created ids, got $(@($created | Select-Object -Unique).Count)" }
-        $after = (Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/groups' -Headers $headers -SkipCertificateCheck -TimeoutSec 15).value.Count
+        $after = (Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/groups?$top=999' -Headers $headers -SkipCertificateCheck -TimeoutSec 15).value.Count
         if ($after -ne $before + 24) { throw "expected $($before + 24) groups after parallel creates, got $after" }
+    }
+
+    Test-Check 'GET /groups?$top=5 pages through every group via @odata.nextLink' {
+        $all = (Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/groups?$top=999&$select=id' -Headers $headers -SkipCertificateCheck -TimeoutSec 15).value.id
+        if ($all.Count -le 5) { throw "need more than 5 groups for this check, got $($all.Count)" }
+        $seen = [System.Collections.Generic.List[string]]::new()
+        $pages = 0
+        $uri = 'https://graph.microsoft.com/v1.0/groups?$top=5&$select=id'
+        while ($uri -and $pages -lt 100) {
+            $page = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -TimeoutSec 15
+            if ($page.value.Count -gt 5) { throw "page $pages has $($page.value.Count) items, expected at most 5" }
+            $seen.AddRange([string[]]@($page.value.id))
+            $uri = $page.'@odata.nextLink'
+            $pages++
+        }
+        if ($seen.Count -ne $all.Count -or @($seen | Select-Object -Unique).Count -ne $all.Count) {
+            throw "paged walk saw $($seen.Count) ids ($(@($seen | Select-Object -Unique).Count) distinct), expected $($all.Count)"
+        }
+    }
+
+    Test-Check 'GET /groups?$top=1000 is rejected like Graph (400)' {
+        try {
+            Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/groups?$top=1000' -Headers $headers -SkipCertificateCheck -TimeoutSec 15 | Out-Null
+            throw 'expected a 400'
+        } catch [Microsoft.PowerShell.Commands.HttpResponseException] {
+            if ($_.Exception.Response.StatusCode.value__ -ne 400) { throw "expected 400, got $($_.Exception.Response.StatusCode.value__)" }
+        }
     }
 
     Test-Check 'POST .../members/$ref adds a reference (204)' {

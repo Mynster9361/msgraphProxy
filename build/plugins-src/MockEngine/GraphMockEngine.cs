@@ -236,12 +236,27 @@ public sealed partial class GraphMockEngine
     // serialization is the simplest correct model. Dev Proxy invokes plugins concurrently.
     private readonly Lock _gate = new();
 
+    private readonly GraphMockPagingOptions _paging;
+
+    // Snapshot-mode result sets, keyed by the id inside the $skiptoken. Bounded: the oldest are evicted,
+    // and a token pointing at an evicted snapshot gets the same 400 an expired real token does.
+    private const int MaxSnapshots = 256;
+    private readonly Dictionary<string, List<JsonObject>> _snapshots = new(StringComparer.Ordinal);
+    private readonly Queue<string> _snapshotOrder = new();
+
+    // Extra headers for the response being built by the current ResolveAndProcess call (e.g.
+    // Preference-Applied). Safe as a field: everything runs under _gate, and ResolveAndProcess
+    // clears it first, so $batch sub-requests never see each other's headers.
+    private List<KeyValuePair<string, string>>? _pendingHeaders;
+
     /// <param name="v1Csdl">Contents of the v1.0 CSDL.</param>
     /// <param name="betaCsdl">Contents of the beta CSDL, or null to leave /beta/* unmocked.</param>
     /// <param name="subscribedSkus">Seeds the subscribedSkus pool instead of generic fabrication, when non-empty.</param>
-    public GraphMockEngine(string v1Csdl, string? betaCsdl = null, IEnumerable<GraphSchemaMockSubscribedSkuConfiguration>? subscribedSkus = null)
+    /// <param name="paging">Page sizes and $skiptoken consistency; defaults match Graph's directory APIs.</param>
+    public GraphMockEngine(string v1Csdl, string? betaCsdl = null, IEnumerable<GraphSchemaMockSubscribedSkuConfiguration>? subscribedSkus = null, GraphMockPagingOptions? paging = null)
     {
         ArgumentNullException.ThrowIfNull(v1Csdl);
+        _paging = paging ?? new GraphMockPagingOptions();
         _v1Registry = ParseSchema(v1Csdl);
         _betaRegistry = betaCsdl is null ? null : ParseSchema(betaCsdl);
         _subscribedSkus = subscribedSkus?.ToList() ?? [];
@@ -652,9 +667,17 @@ public sealed partial class GraphMockEngine
                 filtered = ApplyOrderBy(filtered, orderByTerms);
             }
 
+            // Paging (msgraphProxy P0 #4). The total is taken before paging, so @odata.count
+            // reports the whole result set, not just this page.
+            var page = ApplyPaging(typeFullName, query, request, filtered);
+            if (page.Error is not null)
+            {
+                return (page.Error, HttpStatusCode.BadRequest);
+            }
+
             var selectedProps = GetSelectedProps(registry, typeFullName, request);
             var array = new JsonArray();
-            foreach (var item in filtered)
+            foreach (var item in page.Items)
             {
                 var trimmed = TrimTo(item, selectedProps);
                 ApplyExpand(registry, trimmed, typeFullName, request);
@@ -670,7 +693,17 @@ public sealed partial class GraphMockEngine
             // omits @odata.count instead of rejecting the request.
             if (countTrue && (!isDirectoryObjectType || advancedQueryModeActive))
             {
-                responseBody["@odata.count"] = array.Count;
+                responseBody["@odata.count"] = page.Total;
+            }
+
+            if (page.NextLink is not null)
+            {
+                responseBody["@odata.nextLink"] = page.NextLink;
+            }
+
+            if (page.AppliedMaxPageSize is { } applied)
+            {
+                _pendingHeaders = [new("Preference-Applied", "odata.maxpagesize=" + applied.ToString(CultureInfo.InvariantCulture))];
             }
 
             return (responseBody, HttpStatusCode.OK);
@@ -697,6 +730,165 @@ public sealed partial class GraphMockEngine
         }
 
         return (null, null);
+    }
+
+    private readonly record struct PageResult(List<JsonObject> Items, int Total, string? NextLink, int? AppliedMaxPageSize, JsonObject? Error);
+
+    /// <summary>
+    /// Cuts one page out of a filtered, ordered result set. Page size: $top, else the
+    /// Prefer: odata.maxpagesize preference, else the type's default (the smaller of the two
+    /// when both are given), capped at the type's maximum. $skiptoken is opaque to clients:
+    /// base64url JSON carrying the offset and, in snapshot mode, the id of the result set
+    /// frozen when page 1 was served.
+    /// </summary>
+    private PageResult ApplyPaging(string typeFullName, System.Collections.Specialized.NameValueCollection query, MockRequest request, IEnumerable<JsonObject> filtered)
+    {
+        var (defaultSize, maxSize) = _paging.SizesFor(typeFullName);
+
+        int? top = null;
+        if (query["$top"] is { } topParam)
+        {
+            if (!int.TryParse(topParam, NumberStyles.None, CultureInfo.InvariantCulture, out var parsedTop) || parsedTop < 1 || parsedTop > maxSize)
+            {
+                return new PageResult([], 0, null, null, ODataError(
+                    "Request_BadRequest",
+                    $"Invalid page size specified: '{topParam}'. Must be between 1 and {maxSize.ToString(CultureInfo.InvariantCulture)} inclusive."));
+            }
+
+            top = parsedTop;
+        }
+
+        var preferred = TryGetMaxPageSizePreference(request);
+        int? applied = preferred is { } p ? Math.Clamp(p, 1, maxSize) : null;
+        var pageSize = (top, applied) switch
+        {
+            ({ } t, { } a) => Math.Min(t, a),
+            ({ } t, null) => t,
+            (null, { } a) => a,
+            _ => defaultSize,
+        };
+
+        List<JsonObject> results;
+        var offset = 0;
+        string? snapshotId = null;
+        if (query["$skiptoken"] is { } skipToken)
+        {
+            if (!TryDecodeSkipToken(skipToken, out offset, out snapshotId))
+            {
+                return new PageResult([], 0, null, null, ODataError("Request_BadRequest", "The specified $skiptoken is invalid."));
+            }
+
+            if (snapshotId is not null)
+            {
+                if (!_snapshots.TryGetValue(snapshotId, out var frozen))
+                {
+                    return new PageResult([], 0, null, null, ODataError("Directory_ExpiredPageToken", "The specified page token value has expired and can no longer be included in your request."));
+                }
+
+                results = frozen;
+            }
+            else
+            {
+                results = [.. filtered];
+            }
+        }
+        else
+        {
+            results = [.. filtered];
+            if (_paging.Consistency == GraphMockPagingConsistency.Snapshot && results.Count > pageSize)
+            {
+                snapshotId = Guid.NewGuid().ToString("N");
+                _snapshots[snapshotId] = results;
+                _snapshotOrder.Enqueue(snapshotId);
+                while (_snapshotOrder.Count > MaxSnapshots)
+                {
+                    _ = _snapshots.Remove(_snapshotOrder.Dequeue());
+                }
+            }
+        }
+
+        offset = Math.Min(offset, results.Count);
+        var items = results.Skip(offset).Take(pageSize).ToList();
+        var nextOffset = offset + items.Count;
+        var nextLink = nextOffset < results.Count ? BuildNextLink(request, EncodeSkipToken(nextOffset, snapshotId)) : null;
+
+        return new PageResult(items, results.Count, nextLink, applied, null);
+    }
+
+    private static int? TryGetMaxPageSizePreference(MockRequest request)
+    {
+        if (request.GetHeader("Prefer") is not { } prefer)
+        {
+            return null;
+        }
+
+        const string prefix = "odata.maxpagesize=";
+        foreach (var part in prefer.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (part.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) &&
+                int.TryParse(part[prefix.Length..], NumberStyles.None, CultureInfo.InvariantCulture, out var size))
+            {
+                return size;
+            }
+        }
+
+        return null;
+    }
+
+    private static string EncodeSkipToken(int offset, string? snapshotId)
+    {
+        var json = new JsonObject { ["v"] = 1, ["o"] = offset, ["s"] = snapshotId }.ToJsonString();
+        return Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(json))
+            .TrimEnd('=')
+            .Replace('+', '-')
+            .Replace('/', '_');
+    }
+
+    private static bool TryDecodeSkipToken(string token, out int offset, out string? snapshotId)
+    {
+        offset = 0;
+        snapshotId = null;
+        try
+        {
+            var base64 = token.Replace('-', '+').Replace('_', '/');
+            base64 = base64.PadRight(base64.Length + ((4 - (base64.Length % 4)) % 4), '=');
+            if (JsonNode.Parse(Convert.FromBase64String(base64)) is not JsonObject node ||
+                node["o"] is not JsonValue o || !o.TryGetValue(out offset) || offset < 0)
+            {
+                return false;
+            }
+
+            snapshotId = node["s"] is JsonValue s && s.TryGetValue(out string? sid) ? sid : null;
+            return true;
+        }
+        catch (Exception ex) when (ex is FormatException or JsonException)
+        {
+            return false;
+        }
+    }
+
+    // The nextLink keeps every query option of the current request ($select, $filter, $top, ...)
+    // and replaces only $skiptoken, like Graph's own nextLinks.
+    private static string BuildNextLink(MockRequest request, string skipToken)
+    {
+        var query = System.Web.HttpUtility.ParseQueryString(request.RequestUri.Query);
+        query.Remove("$skiptoken");
+        var parts = new List<string>();
+        foreach (var key in query.AllKeys)
+        {
+            if (key is null)
+            {
+                continue;
+            }
+
+            foreach (var value in query.GetValues(key) ?? [])
+            {
+                parts.Add(Uri.EscapeDataString(key).Replace("%24", "$", StringComparison.Ordinal) + "=" + Uri.EscapeDataString(value));
+            }
+        }
+
+        parts.Add("$skiptoken=" + skipToken);
+        return $"{request.RequestUri.Scheme}://{request.RequestUri.Authority}{request.RequestUri.AbsolutePath}?{string.Join('&', parts)}";
     }
 
     // Real Graph responses always carry "@odata.context" - collections at the
@@ -915,7 +1107,7 @@ public sealed partial class GraphMockEngine
     // separate field rather than stuffing a raw string into a JsonValue and
     // relying on JsonNode.ToString() to hand it back unquoted later, which
     // isn't a documented guarantee worth depending on.
-    private readonly record struct MockResult(JsonNode? Body, HttpStatusCode? StatusCode, string? RawText = null, string? LogLabel = null);
+    private readonly record struct MockResult(JsonNode? Body, HttpStatusCode? StatusCode, string? RawText = null, string? LogLabel = null, IReadOnlyList<KeyValuePair<string, string>>? ExtraHeaders = null);
 
     private MockResult HandleRawSegmentValue(SchemaRegistry registry, ResolvedNode node, string method, MockRequest request)
     {
@@ -978,6 +1170,7 @@ public sealed partial class GraphMockEngine
         }
 
         var restrictions = GetRestrictions(registry, node.SetOrSingletonName, node.TypeFullName);
+        _pendingHeaders = null;
         var (responseBody, statusCode) = node.IsRef
             ? HandleRef(node, method, request)
             : node.Operation is not null
@@ -988,7 +1181,9 @@ public sealed partial class GraphMockEngine
                         ? HandleItem(registry, versionSegment, node.TypeFullName, node.ItemId, method, request, restrictions)
                         : HandleSingleton(registry, versionSegment, node.TypeFullName, method, request, restrictions);
 
-        return new MockResult(responseBody, statusCode, LogLabel: node.TypeFullName);
+        var extraHeaders = _pendingHeaders;
+        _pendingHeaders = null;
+        return new MockResult(responseBody, statusCode, LogLabel: node.TypeFullName, ExtraHeaders: extraHeaders);
     }
 
     private static MockResponse ToResponse(MockResult result, MockRequest request)
@@ -1011,6 +1206,11 @@ public sealed partial class GraphMockEngine
             new("Date", DateTime.Now.ToString("r", CultureInfo.InvariantCulture)),
             new("Content-Type", "application/json"),
         };
+        if (result.ExtraHeaders is not null)
+        {
+            headers.AddRange(result.ExtraHeaders);
+        }
+
         if (request.GetHeader("Origin") is not null)
         {
             headers.Add(new("Access-Control-Allow-Origin", "*"));
@@ -2556,4 +2756,44 @@ internal sealed class EntityPool : IEnumerable<JsonObject>
         item.TryGetPropertyValue("id", out var idNode) && idNode is JsonValue idValue && idValue.TryGetValue(out string? idStr)
             ? idStr
             : null;
+}
+
+/// <summary>How later pages relate to the first one.</summary>
+public enum GraphMockPagingConsistency
+{
+    /// <summary>The result set is frozen when page 1 is served, so a full scan sees exactly that membership.</summary>
+    Snapshot,
+
+    /// <summary>Each page re-evaluates the query and skips by offset, so concurrent inserts and deletes shift items.</summary>
+    Offset,
+}
+
+public sealed class GraphMockPageSizeConfiguration
+{
+    public int? Default { get; set; }
+    public int? Max { get; set; }
+}
+
+/// <summary>Paging settings. Defaults follow Graph's directory APIs: 100 per page, 999 at most.</summary>
+public sealed class GraphMockPagingOptions
+{
+    public int DefaultPageSize { get; set; } = 100;
+    public int MaxPageSize { get; set; } = 999;
+    public GraphMockPagingConsistency Consistency { get; set; } = GraphMockPagingConsistency.Snapshot;
+
+    /// <summary>Per-type overrides keyed by full type name, e.g. "microsoft.graph.message".</summary>
+    public Dictionary<string, GraphMockPageSizeConfiguration> PageSizes { get; } = new(StringComparer.Ordinal);
+
+    internal (int Default, int Max) SizesFor(string typeFullName)
+    {
+        var max = Math.Max(1, MaxPageSize);
+        var def = DefaultPageSize;
+        if (PageSizes.TryGetValue(typeFullName, out var overrides))
+        {
+            max = Math.Max(1, overrides.Max ?? max);
+            def = overrides.Default ?? def;
+        }
+
+        return (Math.Clamp(def, 1, max), max);
+    }
 }

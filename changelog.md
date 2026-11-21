@@ -8,6 +8,8 @@
 + Fix: requests to `dod-graph.microsoft.us` were watched but never mocked, so they went to the real DoD Graph endpoint. Dev Proxy's `IsGraphUrl` doesn't match that host; the new `GraphHosts` registry does.
 + Fix: the mock engine is now thread-safe. Dev Proxy runs plugins concurrently, and parallel writes could be lost. Lookups by id now use an index instead of a linear scan.
 + Add: `graphSchemaMockPlugin.strict` returns a 404/405 Graph error for anything the mock can't answer instead of forwarding it to the real service. Off by default.
++ Add: paging for collection GETs. Supports `$top`, `Prefer: odata.maxpagesize` (acknowledged with `Preference-Applied`), an opaque `$skiptoken` and `@odata.nextLink`, which keeps the other query options. The defaults match Graph's directory APIs: 100 per page and at most 999; `$top` outside that range gets Graph's 400. `@odata.count` is now the total, not the page size. Configure it with `graphSchemaMockPlugin.paging`: `defaultPageSize`, `maxPageSize`, per-type `pageSizes`, and `consistency` (`Snapshot`, the default, freezes the result set on page 1; `Offset` re-evaluates every page).
++ Change: collections with more than 100 items now return 100 per page with a nextLink, like Graph. Before, they returned everything at once.
 + Add: `graphSchemaMockPlugin.additionalGraphHosts` for extra Graph hosts, such as sovereign clouds. They must also be listed in `urlsToWatch`.
 
 ## 1.1.1 (2026-10-09)

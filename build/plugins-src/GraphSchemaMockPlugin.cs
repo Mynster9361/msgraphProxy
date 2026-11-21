@@ -29,6 +29,9 @@ public sealed class GraphSchemaMockPluginConfiguration
     // Graph hosts beyond the built-in ones (graph.microsoft.com/.us, dod-graph.microsoft.us,
     // microsoftgraph.chinacloudapi.cn), e.g. sovereign-cloud endpoints. They must also be in urlsToWatch.
     public IEnumerable<string> AdditionalGraphHosts { get; set; } = [];
+    // Page sizes ($top / Prefer: odata.maxpagesize / defaults, per type) and $skiptoken consistency
+    // ("Snapshot" freezes the result set on page 1, "Offset" re-evaluates every page).
+    public GraphMockPagingOptions Paging { get; set; } = new();
 }
 
 /// <summary>
@@ -85,7 +88,7 @@ public sealed class GraphSchemaMockPlugin(
             }
         }
 
-        _engine = new GraphMockEngine(v1Csdl, betaCsdl, Configuration.SubscribedSkus);
+        _engine = new GraphMockEngine(v1Csdl, betaCsdl, Configuration.SubscribedSkus, Configuration.Paging);
         _graphHosts = new GraphHosts(Configuration.AdditionalGraphHosts);
         LogRegistryLoaded("v1.0", schemaFilePath);
         if (betaCsdl is not null)
