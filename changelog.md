@@ -12,6 +12,9 @@
 + Add: reproducible mocks through `graphSchemaMockPlugin.determinism`. With a `seed`, the same requests give byte-identical responses: ids are name-based (record *i* of a type is always the same id), and generated GUIDs, request-ids and `$skiptoken`s follow the seed. `fixedNow` pins the clock for generated dates and the `Date` header. `defaultPoolSize` and per-type `poolSizes` (for example 500 users) set how many records are seeded.
 + Change: entity results of functions (`delta()`, `getAllSites()`, ...) and `$expand`ed navigation properties now come from the type's pool, so their ids resolve on a follow-up GET. Before, they were fresh, unresolvable fabrications.
 + Fix: the `Date` response header was local time labeled as GMT. It is now UTC.
++ Add: each `$batch` sub-response has its own `headers` object: `Content-Type` (JSON or text/plain), plus headers the same request would get at the top level, such as `Preference-Applied`.
++ Fix: `$batch` sub-requests used a hard-coded `graph.microsoft.com`, so nextLinks and `@odata.context` inside a US Gov, DoD or China batch pointed at the wrong cloud. They now use the host the batch was sent to.
++ Change: an absolute URL in a `$batch` sub-request now gets its own 400 instead of being quietly re-rooted.
 + Change: collections with more than 100 items now return 100 per page with a nextLink, like Graph. Before, they returned everything at once.
 + Add: `graphSchemaMockPlugin.additionalGraphHosts` for extra Graph hosts, such as sovereign clouds. They must also be listed in `urlsToWatch`.
 

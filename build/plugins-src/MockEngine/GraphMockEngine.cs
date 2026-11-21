@@ -440,7 +440,7 @@ public sealed partial class GraphMockEngine
             }
         }
 
-        var results = new Dictionary<string, (int Status, JsonNode? Body)>(StringComparer.OrdinalIgnoreCase);
+        var results = new Dictionary<string, SubResponse>(StringComparer.OrdinalIgnoreCase);
         var pending = new List<(string Id, string Method, string Url, JsonObject? Headers, string? Body, List<string> DependsOn)>(subRequests);
 
         // "Batch should be either fully sequential or fully parallel" per
@@ -461,8 +461,8 @@ public sealed partial class GraphMockEngine
 
                 var failedDependency = sub.DependsOn.FirstOrDefault(d => results[d].Status >= 400);
                 results[sub.Id] = failedDependency is not null
-                    ? (424, ODataError("Request_Dependency", $"Request depends on '{failedDependency}', which failed."))
-                    : ProcessBatchSubRequest(registry, versionSegment, sub.Method, sub.Url, sub.Headers, sub.Body);
+                    ? SubResponse.Json(424, ODataError("Request_Dependency", $"Request depends on '{failedDependency}', which failed."))
+                    : ProcessBatchSubRequest(registry, versionSegment, request.RequestUri, sub.Method, sub.Url, sub.Headers, sub.Body);
 
                 pending.RemoveAt(i);
                 progressed = true;
@@ -474,7 +474,7 @@ public sealed partial class GraphMockEngine
                 // client would send, but fail loud rather than loop forever.
                 foreach (var sub in pending)
                 {
-                    results[sub.Id] = (400, ODataError("BadRequest", $"Request '{sub.Id}' is part of a circular dependsOn chain."));
+                    results[sub.Id] = SubResponse.Json(400, ODataError("BadRequest", $"Request '{sub.Id}' is part of a circular dependsOn chain."));
                 }
 
                 break;
@@ -486,53 +486,95 @@ public sealed partial class GraphMockEngine
         // dependency-resolved order rather than reconstructing the original
         // array order is a faithful, not just convenient, choice.
         var responses = new JsonArray();
-        foreach (var (id, (status, body)) in results)
+        foreach (var (id, sub) in results)
         {
-            responses.Add(new JsonObject
+            var entry = new JsonObject
             {
                 ["id"] = id,
-                ["status"] = status,
-                ["body"] = body?.DeepClone(),
-            });
+                ["status"] = sub.Status,
+            };
+
+            // Each sub-response carries its own headers, like Graph's (Content-Type, plus anything the
+            // same request would get at the top level, e.g. Preference-Applied; Retry-After once #7 lands).
+            if (sub.Headers.Count > 0)
+            {
+                var headerObject = new JsonObject();
+                foreach (var (name, value) in sub.Headers)
+                {
+                    headerObject[name] = value;
+                }
+
+                entry["headers"] = headerObject;
+            }
+
+            entry["body"] = sub.Body?.DeepClone();
+            responses.Add(entry);
         }
 
         return new MockResult(new JsonObject { ["responses"] = responses }, HttpStatusCode.OK, LogLabel: $"$batch: {subRequests.Count} sub-request(s)");
     }
 
-    private (int Status, JsonNode? Body) ProcessBatchSubRequest(SchemaRegistry registry, string versionSegment, string method, string url, JsonObject? headers, string? body)
+    private readonly record struct SubResponse(int Status, JsonNode? Body, IReadOnlyList<KeyValuePair<string, string>> Headers)
     {
-        // Sub-request urls are relative to the same version the outer
-        // $batch call targeted (e.g. "/me/memberOf" or "users?$select=...",
-        // both shown as real examples in the doc) - prefixing with
-        // versionSegment and re-running the exact same resolve/dispatch
-        // path used for a real top-level request is what makes every
-        // $filter/$expand/$search/advanced-query behavior already built
-        // into this plugin work identically inside a batch, for free.
+        public static SubResponse Json(int status, JsonNode? body, IReadOnlyList<KeyValuePair<string, string>>? extra = null)
+        {
+            var headers = new List<KeyValuePair<string, string>>();
+            if (body is not null)
+            {
+                headers.Add(new("Content-Type", "application/json"));
+            }
+
+            if (extra is not null)
+            {
+                headers.AddRange(extra);
+            }
+
+            return new SubResponse(status, body, headers);
+        }
+    }
+
+    private SubResponse ProcessBatchSubRequest(SchemaRegistry registry, string versionSegment, Uri batchUri, string method, string url, JsonObject? headers, string? body)
+    {
+        // Sub-request urls must be relative to the $batch endpoint (e.g. "/me/memberOf" or
+        // "users?$select=..."). An absolute url is rejected for that sub-request rather than silently
+        // re-rooted, which would hide a client bug.
+        if (url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) || url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        {
+            return SubResponse.Json((int)HttpStatusCode.BadRequest, ODataError("BadRequest", $"Invalid request URL '{url}': batch request URLs must be relative to the $batch endpoint."));
+        }
+
+        // Prefixing with versionSegment and re-running the exact same resolve/dispatch path used
+        // for a top-level request makes every $filter/$expand/$search/paging behavior work
+        // identically inside a batch. The scheme and host are the outer request's, so nextLinks
+        // and @odata.context point at the cloud the client actually called.
         var queryIdx = url.IndexOf('?', StringComparison.Ordinal);
         var query = queryIdx >= 0 ? url[queryIdx..] : "";
         var path = (queryIdx >= 0 ? url[..queryIdx] : url).TrimStart('/');
-        var absoluteUri = new Uri($"https://graph.microsoft.com{versionSegment}{path}{query}");
+        var absoluteUri = new Uri($"{batchUri.Scheme}://{batchUri.Authority}{versionSegment}{path}{query}");
 
         var subRequest = new MockRequest(absoluteUri, name => GetJsonHeader(headers, name), body);
 
         var result = ResolveAndProcess(registry, versionSegment, method, absoluteUri.AbsolutePath, subRequest);
         if (result is null)
         {
-            return ((int)HttpStatusCode.NotFound, ODataError("Request_ResourceNotFound", $"Resource not found for the segment '{url}'."));
+            return SubResponse.Json((int)HttpStatusCode.NotFound, ODataError("Request_ResourceNotFound", $"Resource not found for the segment '{url}'."));
         }
 
         if (result.Value.StatusCode is null)
         {
-            // Method genuinely unsupported for this resource shape (e.g.
-            // DELETE on a singleton) - real Graph would 405 here, matching
-            // exactly the shape shown in the doc's own example response
-            // (request 4: "Specified HTTP method is not allowed for the
-            // request target").
-            return ((int)HttpStatusCode.MethodNotAllowed, ODataError("Request_BadRequest", "Specified HTTP method is not allowed for the request target."));
+            // Method genuinely unsupported for this resource shape (e.g. DELETE on a singleton):
+            // the shape of the doc's own example ("Specified HTTP method is not allowed ...").
+            return SubResponse.Json((int)HttpStatusCode.MethodNotAllowed, ODataError("Request_BadRequest", "Specified HTTP method is not allowed for the request target."));
         }
 
-        var responseBody = result.Value.RawText is not null ? JsonValue.Create(result.Value.RawText) : result.Value.Body;
-        return ((int)result.Value.StatusCode.Value, responseBody);
+        var status = (int)result.Value.StatusCode.Value;
+        if (result.Value.RawText is not null)
+        {
+            var textHeaders = new List<KeyValuePair<string, string>> { new("Content-Type", "text/plain") };
+            return new SubResponse(status, JsonValue.Create(result.Value.RawText), textHeaders);
+        }
+
+        return SubResponse.Json(status, result.Value.Body, result.Value.ExtraHeaders);
     }
 
     private static string? GetJsonHeader(JsonObject? headers, string name)

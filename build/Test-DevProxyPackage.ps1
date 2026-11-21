@@ -520,6 +520,19 @@ try {
         if ($r.responses[0].status -ne 404) { throw "expected 404, got $($r.responses[0].status)" }
     }
 
+    Test-Check '$batch: sub-responses carry headers, use the outer host, reject absolute urls' {
+        $body = @{ requests = @(
+                @{ id = 'paged'; method = 'GET'; url = '/groups?$top=1' }
+                @{ id = 'absolute'; method = 'GET'; url = 'https://dod-graph.microsoft.us/v1.0/users' }
+            ) } | ConvertTo-Json -Depth 10
+        $r = Invoke-RestMethod -Uri 'https://dod-graph.microsoft.us/v1.0/$batch' -Method POST -Headers $headers -Body $body -ContentType 'application/json' -SkipCertificateCheck -TimeoutSec 15
+        $paged = $r.responses | Where-Object id -EQ 'paged'
+        $absolute = $r.responses | Where-Object id -EQ 'absolute'
+        if ($paged.headers.'Content-Type' -ne 'application/json') { throw "expected a Content-Type sub-response header, got '$($paged.headers.'Content-Type')'" }
+        if ($paged.body.'@odata.nextLink' -notlike 'https://dod-graph.microsoft.us/*') { throw "expected a dod-graph nextLink, got '$($paged.body.'@odata.nextLink')'" }
+        if ($absolute.status -ne 400) { throw "expected 400 for an absolute sub-request url, got $($absolute.status)" }
+    }
+
     Test-Check '$expand surfaces a navigation property' {
         $r = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/${userId}?`$expand=manager" -Headers $headers -SkipCertificateCheck -TimeoutSec 15
         if (-not $r.manager) { throw 'expected a manager property to be present' }
