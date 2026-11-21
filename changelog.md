@@ -1,5 +1,11 @@
 ﻿# Changelog
 
+## Unreleased
+
++ Change: GraphSchemaMockPlugin's mock logic now lives in an engine-agnostic `MockEngine` (build/plugins-src/MockEngine/) with no Dev Proxy dependencies. The plugin is a thin Dev Proxy v3 adapter. Behavior is unchanged; all smoke checks pass.
++ Add: `GraphMockHttpMessageHandler` runs the same engine in-process behind an `HttpClient`, with no proxy, certificates or network.
++ Change: Build-DevProxyPackage.ps1 copies plugin sources recursively so subfolders are compiled.
+
 ## 1.1.1 (2026-10-09)
 
 + Fix: New devproxy release added security arround the proxy api meaning we needed a token in order to see queries processed.
