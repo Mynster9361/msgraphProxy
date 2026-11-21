@@ -140,10 +140,90 @@ try {
         if ($r.id -ne $userId) { throw "expected id $userId, got $($r.id)" }
     }
 
+    # dod-graph.microsoft.us is in the shipped urlsToWatch, but Dev Proxy's IsGraphUrl doesn't match it,
+    # so before GraphHosts these requests went to the real DoD endpoint (a 401 for this fake token).
+    Test-Check 'GET dod-graph.microsoft.us /users is mocked, not forwarded' {
+        $r = Invoke-RestMethod -Uri 'https://dod-graph.microsoft.us/v1.0/users' -Headers $headers -SkipCertificateCheck -TimeoutSec 15
+        if ($r.value.Count -lt 1) { throw "expected at least 1 user, got $($r.value.Count)" }
+        if ($r.'@odata.context' -notlike 'https://dod-graph.microsoft.us/*') { throw "unexpected @odata.context $($r.'@odata.context')" }
+    }
+
+    # Dev Proxy invokes plugins concurrently; the engine's shared pools must survive parallel writes.
+    Test-Check 'parallel POST /groups are all stored (thread safety)' {
+        # $top=999: collections are paged (100 by default), and this counts the whole pool.
+        $before = (Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/groups?$top=999' -Headers $headers -SkipCertificateCheck -TimeoutSec 15).value.Count
+        $created = 1..24 | ForEach-Object -ThrottleLimit 12 -Parallel {
+            $body = @{ displayName = "parallel-$_"; mailNickname = "parallel$_" } | ConvertTo-Json
+            (Invoke-RestMethod -Method Post -Uri 'https://graph.microsoft.com/v1.0/groups' -Headers $using:headers -Body $body -ContentType 'application/json' -SkipCertificateCheck -TimeoutSec 30).id
+        }
+        if (@($created | Select-Object -Unique).Count -ne 24) { throw "expected 24 distinct created ids, got $(@($created | Select-Object -Unique).Count)" }
+        $after = (Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/groups?$top=999' -Headers $headers -SkipCertificateCheck -TimeoutSec 15).value.Count
+        if ($after -ne $before + 24) { throw "expected $($before + 24) groups after parallel creates, got $after" }
+    }
+
+    Test-Check 'GET /groups?$top=5 pages through every group via @odata.nextLink' {
+        $all = (Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/groups?$top=999&$select=id' -Headers $headers -SkipCertificateCheck -TimeoutSec 15).value.id
+        if ($all.Count -le 5) { throw "need more than 5 groups for this check, got $($all.Count)" }
+        $seen = [System.Collections.Generic.List[string]]::new()
+        $pages = 0
+        $uri = 'https://graph.microsoft.com/v1.0/groups?$top=5&$select=id'
+        while ($uri -and $pages -lt 100) {
+            $page = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -TimeoutSec 15
+            if ($page.value.Count -gt 5) { throw "page $pages has $($page.value.Count) items, expected at most 5" }
+            $seen.AddRange([string[]]@($page.value.id))
+            $uri = $page.'@odata.nextLink'
+            $pages++
+        }
+        if ($seen.Count -ne $all.Count -or @($seen | Select-Object -Unique).Count -ne $all.Count) {
+            throw "paged walk saw $($seen.Count) ids ($(@($seen | Select-Object -Unique).Count) distinct), expected $($all.Count)"
+        }
+    }
+
+    Test-Check 'GET /groups?$top=1000 is rejected like Graph (400)' {
+        try {
+            Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/groups?$top=1000' -Headers $headers -SkipCertificateCheck -TimeoutSec 15 | Out-Null
+            throw 'expected a 400'
+        } catch [Microsoft.PowerShell.Commands.HttpResponseException] {
+            if ($_.Exception.Response.StatusCode.value__ -ne 400) { throw "expected 400, got $($_.Exception.Response.StatusCode.value__)" }
+        }
+    }
+
+    Test-Check 'GET /users?$select=<unknown property> is rejected like Graph (400)' {
+        $ok = Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/users?$select=id,displayName' -Headers $headers -SkipCertificateCheck -TimeoutSec 15
+        if ($ok.value.Count -lt 1) { throw 'a valid $select should still return users' }
+        try {
+            Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/users?$select=id,notAProperty' -Headers $headers -SkipCertificateCheck -TimeoutSec 15 | Out-Null
+            throw 'expected a 400'
+        } catch [Microsoft.PowerShell.Commands.HttpResponseException] {
+            if ($_.Exception.Response.StatusCode.value__ -ne 400) { throw "expected 400, got $($_.Exception.Response.StatusCode.value__)" }
+            $message = ($_.ErrorDetails.Message | ConvertFrom-Json).error.message
+            if ($message -ne "Could not find a property named 'notAProperty' on type 'microsoft.graph.user'.") { throw "unexpected error message: $message" }
+        }
+    }
+
     Test-Check 'POST .../members/$ref adds a reference (204)' {
         $body = @{ '@odata.id' = 'https://graph.microsoft.com/v1.0/directoryObjects/11111111-1111-1111-1111-111111111111' } | ConvertTo-Json
         $r = Invoke-WebRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/groups/22222222-2222-2222-2222-222222222222/members/`$ref" -Headers $headers -Body $body -ContentType 'application/json' -SkipCertificateCheck -TimeoutSec 15
         if ($r.StatusCode -ne 204) { throw "expected 204, got $($r.StatusCode)" }
+    }
+
+    Test-Check 'contained collections hold different data per parent (P1 #9)' {
+        $ids = (Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/users?$top=2&$select=id' -Headers $headers -SkipCertificateCheck -TimeoutSec 15).value.id
+        $a = (Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/$($ids[0])/messages?`$select=id" -Headers $headers -SkipCertificateCheck -TimeoutSec 15).value.id
+        $b = (Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/$($ids[1])/messages?`$select=id" -Headers $headers -SkipCertificateCheck -TimeoutSec 15).value.id
+        if (-not $a -or -not $b) { throw 'expected messages for both users' }
+        if (@($a | Where-Object { $b -contains $_ }).Count -gt 0) { throw 'two users share message ids' }
+    }
+
+    Test-Check 'relationships point at real records with @odata.type, and casts filter (P1 #10, #11)' {
+        $group = (Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/groups?$top=1&$select=id' -Headers $headers -SkipCertificateCheck -TimeoutSec 15).value[0].id
+        $members = (Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/groups/$group/members" -Headers $headers -SkipCertificateCheck -TimeoutSec 15).value
+        if (-not $members) { throw 'expected group members' }
+        if (@($members | Where-Object { $_.'@odata.type' -ne '#microsoft.graph.user' }).Count -gt 0) { throw 'members should be users with @odata.type' }
+        $user = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/$($members[0].id)" -Headers $headers -SkipCertificateCheck -TimeoutSec 15
+        if ($user.id -ne $members[0].id) { throw 'a member should resolve at /users/{id}' }
+        $cast = (Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/groups/$group/members/microsoft.graph.user" -Headers $headers -SkipCertificateCheck -TimeoutSec 15).value
+        if (@($cast).Count -ne @($members).Count) { throw "cast returned $(@($cast).Count) of $(@($members).Count) members" }
     }
 
     Test-Check 'POST .../checkMemberGroups (bound Action) returns a value array' {
@@ -404,7 +484,7 @@ try {
             requests = @(
                 @{ id = '1'; method = 'GET'; url = '/users' }
                 @{ id = '2'; method = 'GET'; url = "/users/$userId" }
-                @{ id = '3'; method = 'POST'; url = "/groups/22222222-2222-2222-2222-222222222222/members/`$ref"; body = @{ '@odata.id' = 'https://graph.microsoft.com/v1.0/directoryObjects/11111111-1111-1111-1111-111111111111' }; headers = @{ 'Content-Type' = 'application/json' } }
+                @{ id = '3'; method = 'POST'; url = "/groups/22222222-2222-2222-2222-222222222222/members/`$ref"; body = @{ '@odata.id' = 'https://graph.microsoft.com/v1.0/directoryObjects/33333333-3333-3333-3333-333333333333' }; headers = @{ 'Content-Type' = 'application/json' } }
             )
         } | ConvertTo-Json -Depth 10
         $r = Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/$batch' -Method POST -Headers $headers -Body $body -ContentType 'application/json' -SkipCertificateCheck -TimeoutSec 15
@@ -472,9 +552,47 @@ try {
         if ($r.responses[0].status -ne 404) { throw "expected 404, got $($r.responses[0].status)" }
     }
 
+    Test-Check '$batch: sub-responses carry headers, use the outer host, reject absolute urls' {
+        $body = @{ requests = @(
+                @{ id = 'paged'; method = 'GET'; url = '/groups?$top=1' }
+                @{ id = 'absolute'; method = 'GET'; url = 'https://dod-graph.microsoft.us/v1.0/users' }
+            ) } | ConvertTo-Json -Depth 10
+        $r = Invoke-RestMethod -Uri 'https://dod-graph.microsoft.us/v1.0/$batch' -Method POST -Headers $headers -Body $body -ContentType 'application/json' -SkipCertificateCheck -TimeoutSec 15
+        $paged = $r.responses | Where-Object id -EQ 'paged'
+        $absolute = $r.responses | Where-Object id -EQ 'absolute'
+        if ($paged.headers.'Content-Type' -ne 'application/json') { throw "expected a Content-Type sub-response header, got '$($paged.headers.'Content-Type')'" }
+        if ($paged.body.'@odata.nextLink' -notlike 'https://dod-graph.microsoft.us/*') { throw "expected a dod-graph nextLink, got '$($paged.body.'@odata.nextLink')'" }
+        if ($absolute.status -ne 400) { throw "expected 400 for an absolute sub-request url, got $($absolute.status)" }
+    }
+
     Test-Check '$expand surfaces a navigation property' {
         $r = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/${userId}?`$expand=manager" -Headers $headers -SkipCertificateCheck -TimeoutSec 15
         if (-not $r.manager) { throw 'expected a manager property to be present' }
+    }
+
+    Test-Check 'control endpoint: stats, and a scenario applied then cleared' {
+        $control = 'https://graph.microsoft.com/_msgraphproxy'
+        $stats = Invoke-RestMethod -Uri "$control/stats" -Headers $headers -SkipCertificateCheck -TimeoutSec 15
+        if ($stats.requests -lt 1) { throw "expected the earlier checks to be counted, got requests=$($stats.requests)" }
+
+        $scenario = @{ rules = @(@{ name = 'org-down'; path = '/organization'; status = 503; scope = 'DirectOnly' }) } | ConvertTo-Json -Depth 5
+        Invoke-RestMethod -Method Put -Uri "$control/scenario" -Headers $headers -Body $scenario -ContentType 'application/json' -SkipCertificateCheck -TimeoutSec 15 | Out-Null
+        try {
+            try {
+                Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/organization' -Headers $headers -SkipCertificateCheck -TimeoutSec 15 | Out-Null
+                throw 'expected the scenario to fail /organization with 503'
+            } catch [Microsoft.PowerShell.Commands.HttpResponseException] {
+                if ($_.Exception.Response.StatusCode.value__ -ne 503) { throw "expected 503, got $($_.Exception.Response.StatusCode.value__)" }
+            }
+
+            $hits = (Invoke-RestMethod -Uri "$control/stats" -Headers $headers -SkipCertificateCheck -TimeoutSec 15).ruleHits.'org-down'
+            if ($hits -ne 1) { throw "expected 1 hit for org-down, got $hits" }
+        } finally {
+            Invoke-RestMethod -Method Put -Uri "$control/scenario" -Headers $headers -Body '{}' -ContentType 'application/json' -SkipCertificateCheck -TimeoutSec 15 | Out-Null
+        }
+
+        $org = Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/organization' -Headers $headers -SkipCertificateCheck -TimeoutSec 15
+        if (-not $org.value) { throw 'expected /organization to work again after clearing the scenario' }
     }
 
     Test-Check 'POST .../oauth2/token (EntraTokenMockPlugin) issues a token' {

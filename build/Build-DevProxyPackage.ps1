@@ -118,7 +118,14 @@ try {
 
     Write-Verbose 'Adding msgraphProxy plugin sources'
     $pluginsMockingDir = Join-Path -Path $cloneRoot -ChildPath 'DevProxy.Plugins\Mocking'
-    Copy-Item -Path (Join-Path -Path $pluginsSourceRoot -ChildPath '*.cs') -Destination $pluginsMockingDir -Force
+    # Recursive, keeping subfolders: the engine-agnostic mock core lives in plugins-src/MockEngine/
+    # and the SDK-style DevProxy.Plugins project compiles every **/*.cs under its folder.
+    foreach ($sourceFile in Get-ChildItem -Path $pluginsSourceRoot -Filter '*.cs' -Recurse -File) {
+        $relative = [System.IO.Path]::GetRelativePath($pluginsSourceRoot, $sourceFile.FullName)
+        $target = Join-Path -Path $pluginsMockingDir -ChildPath $relative
+        New-Item -Path (Split-Path -Path $target -Parent) -ItemType Directory -Force | Out-Null
+        Copy-Item -Path $sourceFile.FullName -Destination $target -Force
+    }
 
     Write-Verbose 'Patching ProxyEngine.cs so installCert:false no longer breaks per-domain certificate generation or hangs on Windows CI'
     $proxyEngineFile = Join-Path -Path $cloneRoot -ChildPath 'DevProxy\Proxy\ProxyEngine.cs'
