@@ -61,6 +61,11 @@
     re-verifying every patch by hand against the new major version - never
     just let it drift forward on its own.
 
+.PARAMETER SdkVersion
+    The .NET SDK the upstream Dev Proxy build pins through a global.json in the clone
+    (rollForward latestFeature, no prereleases), so a runner image with a newer or preview
+    SDK doesn't change which analyzer findings fail the build. Default: 10.0.100.
+
 .PARAMETER OutputPath
     Directory to write the packaged zip files to.
 
@@ -83,6 +88,11 @@ param (
 
     [int]
     $MajorVersion = 3,
+
+    [string]
+    # The SDK the upstream Dev Proxy build pins (written as global.json into the clone, with
+    # rollForward latestFeature and no prereleases): the newest stable 10.0.x that is installed.
+    $SdkVersion = '10.0.100',
 
     [string]
     $OutputPath = (Join-Path -Path $PSScriptRoot -ChildPath '..\package')
@@ -115,6 +125,18 @@ if (-not $Ref) {
 try {
     Write-Verbose "Cloning dotnet/dev-proxy@$Ref into $cloneRoot"
     git clone --branch $Ref --depth 1 https://github.com/dotnet/dev-proxy.git $cloneRoot
+
+    # Pin the SDK for the upstream build. Dev Proxy builds with AnalysisMode=AllEnabledByDefault and warnings as
+    # errors, so whichever SDK the machine resolves decides which analyzer findings fail the build. Without a
+    # global.json that is simply the newest SDK installed - on hosted runners possibly a newer band or a preview
+    # than the one setup-dotnet installed (a runner image update once broke the build with CA1860 errors in
+    # upstream files). Latest stable 10.0.x, no previews.
+    if (-not (Test-Path -Path (Join-Path -Path $cloneRoot -ChildPath 'global.json'))) {
+        Write-Verbose "Pinning the .NET SDK for the Dev Proxy build: $SdkVersion (latestFeature, no prereleases)"
+        [ordered]@{ sdk = [ordered]@{ version = $SdkVersion; rollForward = 'latestFeature'; allowPrerelease = $false } } |
+            ConvertTo-Json | Set-Content -Path (Join-Path -Path $cloneRoot -ChildPath 'global.json') -Encoding utf8
+    }
+
 
     Write-Verbose 'Adding msgraphProxy plugin sources'
     $pluginsMockingDir = Join-Path -Path $cloneRoot -ChildPath 'DevProxy.Plugins\Mocking'
@@ -268,16 +290,23 @@ try {
         Set-Content -Path $filePath -Value $content -NoNewline
     }
 
+    # The .NET CLI looks for global.json from the current directory, not the project's, so build from the clone
+    # or the pin above doesn't apply.
+    Push-Location -Path $cloneRoot
+    try {
+    Write-Verbose "Building with .NET SDK $(dotnet --version)"
     foreach ($currentRid in $Rid) {
         Write-Verbose "Publishing devproxy for $currentRid"
         $publishDir = Join-Path -Path $cloneRoot -ChildPath "dist\$currentRid"
         $devProxyProject = Join-Path -Path $cloneRoot -ChildPath 'DevProxy\DevProxy.csproj'
 
         dotnet publish $devProxyProject -c Release -r $currentRid --self-contained true -o $publishDir
+        if ($LASTEXITCODE -ne 0) { throw "dotnet publish of Dev Proxy for $currentRid failed (exit code $LASTEXITCODE)." }
 
         Write-Verbose "Building plugins for $currentRid"
         $pluginsProject = Join-Path -Path $cloneRoot -ChildPath 'DevProxy.Plugins\DevProxy.Plugins.csproj'
         dotnet build $pluginsProject -c Release -r $currentRid --no-self-contained
+        if ($LASTEXITCODE -ne 0) { throw "dotnet build of the plugins for $currentRid failed (exit code $LASTEXITCODE)." }
 
         $builtPluginsDir = Join-Path -Path $cloneRoot -ChildPath "DevProxy\bin\Release\net10.0\$currentRid\plugins"
         $publishedPluginsDir = Join-Path -Path $publishDir -ChildPath 'plugins'
@@ -290,6 +319,10 @@ try {
         Compress-Archive -Path (Join-Path -Path $publishDir -ChildPath '*') -DestinationPath $zipPath
 
         Write-Verbose "Packaged $currentRid to $zipPath"
+    }
+    }
+    finally {
+        Pop-Location
     }
 }
 finally {
