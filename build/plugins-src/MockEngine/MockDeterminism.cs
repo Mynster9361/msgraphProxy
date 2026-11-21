@@ -61,6 +61,15 @@ public sealed class MockClock : TimeProvider
         }
     }
 
+    /// <summary>Fixes the clock at <paramref name="now"/>, or returns to the real clock when null.</summary>
+    public void Set(DateTimeOffset? now)
+    {
+        lock (_gate)
+        {
+            _now = now?.ToUniversalTime();
+        }
+    }
+
     /// <summary>Moves a fixed clock forward. Has no effect on the real clock.</summary>
     public void Advance(TimeSpan by)
     {

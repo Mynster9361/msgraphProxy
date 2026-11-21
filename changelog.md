@@ -16,6 +16,11 @@
 + Fix: `$batch` sub-requests used a hard-coded `graph.microsoft.com`, so nextLinks and `@odata.context` inside a US Gov, DoD or China batch pointed at the wrong cloud. They now use the host the batch was sent to.
 + Change: an absolute URL in a `$batch` sub-request now gets its own 400 instead of being quietly re-rooted.
 + Change: `$select` with an unknown property now gets Graph's 400 (`Could not find a property named 'x' on type 'T'.`). Properties of the type, its base types and its derived types are accepted, so polymorphic collections like `members` still work. Matching is case-insensitive, and `*` and `extension_*` names are always allowed. Set `graphSchemaMockPlugin.validateSelect` to `false` for clients that select properties this CSDL doesn't declare.
++ Add: a control endpoint at `https://graph.microsoft.com/_msgraphproxy/`, watched by the shipped `devproxyrc.json`. Control calls are never counted or throttled.
+  + `GET stats`: requests, `$batch` sub-requests, non-GET requests, 429s served, faults per rule, `Retry-After` violations.
+  + `POST reset` (optionally `{"seed": n}`): fresh pools, snapshots, fault state, counters and clock. With the same seed, it matches a newly started mock byte for byte.
+  + `GET|POST clock` (`{"now": "..."}` or `{"now": null}`) and `POST clock/advance` (`{"seconds": n}` or `?seconds=n`).
+  + `GET|PUT scenario`: replaces the fault rules, buckets and mailbox limit at runtime. `{}` turns faults off.
 + Add: fault injection and throttling through `graphSchemaMockPlugin.faults`. Everything is off until configured.
   + `rules`: match by path glob (`*` is one segment, `**` is any), method, query text, header, and `DirectOnly`/`BatchOnly`. Each rule returns a status with an optional `Retry-After`, `probability` (drawn from the seed when set), `everyNth`, `maxHits`, or pure `latencyMs`.
   + `mailboxConcurrencyLimit` (Graph's is 4): more concurrent requests to one mailbox get 429 `ApplicationThrottled`. Parallel `$batch` sub-requests to the same mailbox count together.

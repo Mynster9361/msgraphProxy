@@ -139,6 +139,15 @@ internal sealed class FaultGate(GraphMockFaultOptions options, MockClock clock)
 
     public bool HasRules => options.Rules.Count > 0;
 
+    public GraphMockFaultOptions Options => options;
+
+    /// <summary>Swaps in a new scenario (rules, buckets, mailbox limit) and clears all fault state.</summary>
+    public void Replace(GraphMockFaultOptions newOptions)
+    {
+        options = newOptions;
+        Reset();
+    }
+
     public MockStats Stats() => new(_requests, _subRequests, _nonGet, _throttled, _faults, _violations, new Dictionary<string, long>(_ruleHits, StringComparer.Ordinal));
 
     public void Reset()

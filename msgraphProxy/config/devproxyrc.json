@@ -96,6 +96,7 @@
 	"urlsToWatch": [
 		"https://graph.microsoft.com/v1.0/*",
 		"https://graph.microsoft.com/beta/*",
+		"https://graph.microsoft.com/_msgraphproxy/*",
 		"https://graph.microsoft.us/v1.0/*",
 		"https://graph.microsoft.us/beta/*",
 		"https://dod-graph.microsoft.us/v1.0/*",

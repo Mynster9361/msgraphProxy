@@ -551,6 +551,31 @@ try {
         if (-not $r.manager) { throw 'expected a manager property to be present' }
     }
 
+    Test-Check 'control endpoint: stats, and a scenario applied then cleared' {
+        $control = 'https://graph.microsoft.com/_msgraphproxy'
+        $stats = Invoke-RestMethod -Uri "$control/stats" -Headers $headers -SkipCertificateCheck -TimeoutSec 15
+        if ($stats.requests -lt 1) { throw "expected the earlier checks to be counted, got requests=$($stats.requests)" }
+
+        $scenario = @{ rules = @(@{ name = 'org-down'; path = '/organization'; status = 503; scope = 'DirectOnly' }) } | ConvertTo-Json -Depth 5
+        Invoke-RestMethod -Method Put -Uri "$control/scenario" -Headers $headers -Body $scenario -ContentType 'application/json' -SkipCertificateCheck -TimeoutSec 15 | Out-Null
+        try {
+            try {
+                Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/organization' -Headers $headers -SkipCertificateCheck -TimeoutSec 15 | Out-Null
+                throw 'expected the scenario to fail /organization with 503'
+            } catch [Microsoft.PowerShell.Commands.HttpResponseException] {
+                if ($_.Exception.Response.StatusCode.value__ -ne 503) { throw "expected 503, got $($_.Exception.Response.StatusCode.value__)" }
+            }
+
+            $hits = (Invoke-RestMethod -Uri "$control/stats" -Headers $headers -SkipCertificateCheck -TimeoutSec 15).ruleHits.'org-down'
+            if ($hits -ne 1) { throw "expected 1 hit for org-down, got $hits" }
+        } finally {
+            Invoke-RestMethod -Method Put -Uri "$control/scenario" -Headers $headers -Body '{}' -ContentType 'application/json' -SkipCertificateCheck -TimeoutSec 15 | Out-Null
+        }
+
+        $org = Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/organization' -Headers $headers -SkipCertificateCheck -TimeoutSec 15
+        if (-not $org.value) { throw 'expected /organization to work again after clearing the scenario' }
+    }
+
     Test-Check 'POST .../oauth2/token (EntraTokenMockPlugin) issues a token' {
         $tokenBody = @{ client_id = 'test'; grant_type = 'client_credentials'; client_secret = 'test'; scope = 'https://graph.microsoft.com/.default' }
         $r = Invoke-RestMethod -Method POST -Uri 'https://login.microsoftonline.com/common/oauth2/token' -Body $tokenBody -SkipCertificateCheck -TimeoutSec 15

@@ -240,7 +240,8 @@ public sealed partial class GraphMockEngine
 
     private readonly GraphMockPagingOptions _paging;
     private readonly GraphMockDeterminismOptions _determinism;
-    private readonly MockEntropy _entropy;
+    private MockEntropy _entropy;
+    private int? _seed;
     private readonly FaultGate _faults;
 
     // Snapshot-mode result sets, keyed by the id inside the $skiptoken. Bounded: the oldest are evicted,
@@ -270,7 +271,8 @@ public sealed partial class GraphMockEngine
         ArgumentNullException.ThrowIfNull(v1Csdl);
         _paging = paging ?? new GraphMockPagingOptions();
         _determinism = determinism ?? new GraphMockDeterminismOptions();
-        _entropy = new MockEntropy(_determinism.Seed);
+        _seed = _determinism.Seed;
+        _entropy = new MockEntropy(_seed);
         Clock = new MockClock(_determinism.FixedNow);
         _faults = new FaultGate(faults ?? new GraphMockFaultOptions(), Clock);
         _v1Registry = ParseSchema(v1Csdl);
@@ -305,6 +307,11 @@ public sealed partial class GraphMockEngine
         ArgumentNullException.ThrowIfNull(method);
         ArgumentNullException.ThrowIfNull(request);
 
+        if (MockControl.IsControl(request.RequestUri))
+        {
+            return MockOutcome.Respond(HandleControl(method, request));
+        }
+
         var mailbox = FaultGate.MailboxKeyFor(RelativePath(request.RequestUri));
         _faults.Enter(mailbox);
         try
@@ -329,6 +336,11 @@ public sealed partial class GraphMockEngine
     {
         ArgumentNullException.ThrowIfNull(method);
         ArgumentNullException.ThrowIfNull(request);
+
+        if (MockControl.IsControl(request.RequestUri))
+        {
+            return MockOutcome.Respond(HandleControl(method, request));
+        }
 
         var relativePath = RelativePath(request.RequestUri);
         var mailbox = FaultGate.MailboxKeyFor(relativePath);
@@ -364,6 +376,137 @@ public sealed partial class GraphMockEngine
         lock (_gate)
         {
             return _faults.Stats();
+        }
+    }
+
+    /// <summary>
+    /// Back to a freshly constructed engine: pools, snapshots, fault state, counters and the clock.
+    /// With the same seed, the following responses match a new engine's byte for byte.
+    /// </summary>
+    public void Reset(int? seed = null, bool reseed = false)
+    {
+        lock (_gate)
+        {
+            ResetCore(seed, reseed);
+        }
+    }
+
+    private void ResetCore(int? seed, bool reseed)
+    {
+        if (reseed)
+        {
+            _seed = seed;
+        }
+
+        _entropy = new MockEntropy(_seed);
+        _store.Clear();
+        _snapshots.Clear();
+        _snapshotOrder.Clear();
+        _faults.Reset();
+        Clock.Set(_determinism.FixedNow);
+    }
+
+    private MockResponse HandleControl(string method, MockRequest request)
+    {
+        method = method.ToUpperInvariant();
+        var route = MockControl.Route(request.RequestUri);
+        var body = MockControl.ParseBody(request);
+        lock (_gate)
+        {
+            switch (route, method)
+            {
+                case ("stats", "GET"):
+                    return MockControl.Ok(_faults.Stats());
+
+                case ("reset", "POST"):
+                    {
+                        var reseed = body is not null && body.ContainsKey("seed");
+                        int? seed = reseed && body!["seed"] is JsonValue s && s.TryGetValue(out int parsed) ? parsed : null;
+                        ResetCore(seed, reseed);
+                        return MockControl.Ok(new { reset = true, seed = _seed, now = Clock.GetUtcNow(), clockFixed = Clock.IsFixed });
+                    }
+
+                case ("clock", "GET"):
+                    return MockControl.Ok(new { now = Clock.GetUtcNow(), clockFixed = Clock.IsFixed });
+
+                case ("clock", "POST"):
+                    {
+                        if (body is null || !body.ContainsKey("now"))
+                        {
+                            return MockControl.Error(400, "Body must be {\"now\": \"<ISO 8601>\"}, or {\"now\": null} for the real clock.");
+                        }
+
+                        if (body["now"] is null)
+                        {
+                            Clock.Set(null);
+                        }
+                        else if (body["now"] is JsonValue v && v.TryGetValue(out string? text) &&
+                                 DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var now))
+                        {
+                            Clock.Set(now);
+                        }
+                        else
+                        {
+                            return MockControl.Error(400, "'now' must be an ISO 8601 date-time or null.");
+                        }
+
+                        return MockControl.Ok(new { now = Clock.GetUtcNow(), clockFixed = Clock.IsFixed });
+                    }
+
+                case ("clock/advance", "POST"):
+                    {
+                        if (!Clock.IsFixed)
+                        {
+                            return MockControl.Error(409, "The clock is real time. Fix it first with POST /_msgraphproxy/clock {\"now\": ...} or determinism.fixedNow.");
+                        }
+
+                        var query = System.Web.HttpUtility.ParseQueryString(request.RequestUri.Query);
+                        double seconds;
+                        if (body?["seconds"] is JsonValue sv && sv.TryGetValue(out double fromBody))
+                        {
+                            seconds = fromBody;
+                        }
+                        else if (!double.TryParse(query["seconds"], NumberStyles.Float, CultureInfo.InvariantCulture, out seconds))
+                        {
+                            return MockControl.Error(400, "Give the amount as {\"seconds\": n} or ?seconds=n.");
+                        }
+
+                        if (seconds < 0)
+                        {
+                            return MockControl.Error(400, "The clock only moves forward.");
+                        }
+
+                        Clock.Advance(TimeSpan.FromSeconds(seconds));
+                        return MockControl.Ok(new { now = Clock.GetUtcNow(), clockFixed = true });
+                    }
+
+                case ("scenario", "GET"):
+                    return MockControl.Ok(_faults.Options);
+
+                case ("scenario", "PUT"):
+                    {
+                        GraphMockFaultOptions? scenario;
+                        try
+                        {
+                            scenario = string.IsNullOrWhiteSpace(request.Body) ? null : JsonSerializer.Deserialize<GraphMockFaultOptions>(request.Body, MockControl.Json);
+                        }
+                        catch (JsonException ex)
+                        {
+                            return MockControl.Error(400, "Invalid scenario: " + ex.Message);
+                        }
+
+                        if (scenario is null)
+                        {
+                            return MockControl.Error(400, "Body must be a scenario: {\"rules\": [...], \"buckets\": [...], \"mailboxConcurrencyLimit\": 4}.");
+                        }
+
+                        _faults.Replace(scenario);
+                        return MockControl.Ok(scenario);
+                    }
+
+                default:
+                    return MockControl.Error(404, $"Unknown control route '{method} {route}'. Routes: GET stats, POST reset, GET|POST clock, POST clock/advance, GET|PUT scenario.");
+            }
         }
     }
 
