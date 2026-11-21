@@ -22,6 +22,10 @@ jobs:
               with:
                   dotnet-version: "10.0.x"
 
+            - name: Installed .NET SDKs
+              shell: pwsh
+              run: dotnet --list-sdks
+
             - name: Build Dev Proxy packages
               shell: pwsh
               # No -Ref: the script auto-resolves the newest dev-proxy tag within
@@ -92,6 +96,8 @@ jobs:
 
     publish:
         needs: [build, test-windows, test-linux, test-macos]
+        # Only main releases; a manual run on another branch builds and tests without publishing.
+        if: github.ref == 'refs/heads/main'
         runs-on: windows-latest
         permissions:
             contents: write

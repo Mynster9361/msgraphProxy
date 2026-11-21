@@ -61,6 +61,11 @@
     re-verifying every patch by hand against the new major version - never
     just let it drift forward on its own.
 
+.PARAMETER SdkVersion
+    The .NET SDK the upstream Dev Proxy build pins through a global.json in the clone
+    (rollForward latestFeature, no prereleases), so a runner image with a newer or preview
+    SDK doesn't change which analyzer findings fail the build. Default: 10.0.100.
+
 .PARAMETER OutputPath
     Directory to write the packaged zip files to.
 
@@ -83,6 +88,11 @@ param (
 
     [int]
     $MajorVersion = 3,
+
+    [string]
+    # The SDK the upstream Dev Proxy build pins (written as global.json into the clone, with
+    # rollForward latestFeature and no prereleases): the newest stable 10.0.x that is installed.
+    $SdkVersion = '10.0.100',
 
     [string]
     $OutputPath = (Join-Path -Path $PSScriptRoot -ChildPath '..\package')
@@ -115,6 +125,20 @@ if (-not $Ref) {
 try {
     Write-Verbose "Cloning dotnet/dev-proxy@$Ref into $cloneRoot"
     git clone --branch $Ref --depth 1 https://github.com/dotnet/dev-proxy.git $cloneRoot
+
+    # Pin the SDK for the upstream build. Dev Proxy builds with AnalysisMode=AllEnabledByDefault and warnings as
+    # errors, so whichever SDK the machine resolves decides which analyzer findings fail the build. Without a
+    # global.json that is simply the newest SDK installed - on hosted runners possibly a newer band or a preview
+    # than the one setup-dotnet installed (a runner image update once broke the build with CA1860 errors in
+    # upstream files). Latest stable 10.0.x, no previews.
+    if (-not (Test-Path -Path (Join-Path -Path $cloneRoot -ChildPath 'global.json'))) {
+        Write-Verbose "Pinning the .NET SDK for the Dev Proxy build: $SdkVersion (latestFeature, no prereleases)"
+        [ordered]@{ sdk = [ordered]@{ version = $SdkVersion; rollForward = 'latestFeature'; allowPrerelease = $false } } |
+            ConvertTo-Json | Set-Content -Path (Join-Path -Path $cloneRoot -ChildPath 'global.json') -Encoding utf8
+    }
+
+    Push-Location $cloneRoot
+    try { Write-Verbose "Building with .NET SDK $(dotnet --version)" } finally { Pop-Location }
 
     Write-Verbose 'Adding msgraphProxy plugin sources'
     $pluginsMockingDir = Join-Path -Path $cloneRoot -ChildPath 'DevProxy.Plugins\Mocking'
