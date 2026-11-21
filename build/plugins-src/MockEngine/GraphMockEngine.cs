@@ -92,6 +92,8 @@ public sealed partial class GraphMockEngine
     {
         public Dictionary<string, string> AliasMap { get; } = new(StringComparer.Ordinal);
         public Dictionary<string, TypeDef> Types { get; } = new(StringComparer.Ordinal);
+        // Lazily computed $select-able member names per type (own, inherited and derived).
+        public Dictionary<string, HashSet<string>> SelectableMembers { get; } = new(StringComparer.Ordinal);
         public Dictionary<string, List<string>> EnumTypes { get; } = new(StringComparer.Ordinal);
         // Keyed by the resolved type each Function/Action's bindingParameter targets.
         public Dictionary<string, List<FunctionActionDef>> FunctionsByBindingType { get; } = new(StringComparer.Ordinal);
@@ -272,6 +274,12 @@ public sealed partial class GraphMockEngine
         _betaRegistry = betaCsdl is null ? null : ParseSchema(betaCsdl);
         _subscribedSkus = subscribedSkus?.ToList() ?? [];
     }
+
+    /// <summary>
+    /// Reject unknown $select names with a 400, like Graph (default). Turn off for clients that
+    /// select properties this CSDL doesn't declare (e.g. beta-only properties on v1.0).
+    /// </summary>
+    public bool ValidateSelectEnabled { get; init; } = true;
 
     /// <summary>The engine's clock: real time, or a fixed "now" that only moves when advanced.</summary>
     public MockClock Clock { get; }
@@ -661,6 +669,12 @@ public sealed partial class GraphMockEngine
                 return (expandError, HttpStatusCode.BadRequest);
             }
 
+            var selectError = ValidateSelectEnabled ? ValidateSelect(registry, typeFullName, request) : null;
+            if (selectError is not null)
+            {
+                return (selectError, HttpStatusCode.BadRequest);
+            }
+
             // Advanced query gate (directory objects only) - see
             // https://learn.microsoft.com/graph/aad-advanced-queries.
             // ConsistencyLevel: eventual + $count=true unlock ne/not/endsWith
@@ -1024,6 +1038,12 @@ public sealed partial class GraphMockEngine
                         return (expandError, HttpStatusCode.BadRequest);
                     }
 
+                    var selectError = ValidateSelectEnabled ? ValidateSelect(registry, typeFullName, request) : null;
+                    if (selectError is not null)
+                    {
+                        return (selectError, HttpStatusCode.BadRequest);
+                    }
+
                     var trimmed = TrimTo(existing, GetSelectedProps(registry, typeFullName, request));
                     ApplyExpand(registry, trimmed, typeFullName, request);
                     trimmed["@odata.context"] = BuildODataContext(versionSegment, request) + "/$entity";
@@ -1073,6 +1093,12 @@ public sealed partial class GraphMockEngine
             if (expandError is not null)
             {
                 return (expandError, HttpStatusCode.BadRequest);
+            }
+
+            var selectError = ValidateSelectEnabled ? ValidateSelect(registry, typeFullName, request) : null;
+            if (selectError is not null)
+            {
+                return (selectError, HttpStatusCode.BadRequest);
             }
         }
 
@@ -1761,6 +1787,85 @@ public sealed partial class GraphMockEngine
     // API (e.g. "Expand not supported for property 'chats'" on /users) - unlike an
     // unrecognized name entirely, which ApplyExpand still silently skips, since that
     // case was never about a genuine restriction.
+    // msgraphProxy P0 #6. Real Graph rejects unknown $select names with a 400, and the harvester's
+    // $select bisection (probing which properties a tenant refuses) depends on that. Names that are
+    // valid on a derived type are accepted, so polymorphic collections (members, memberOf, ...)
+    // don't get false 400s; Graph's own derived-type rules are learned by probing a real tenant.
+    private static JsonObject? ValidateSelect(SchemaRegistry registry, string typeFullName, MockRequest request)
+    {
+        var query = System.Web.HttpUtility.ParseQueryString(request.RequestUri.Query);
+        var selectParam = query["$select"];
+        if (string.IsNullOrWhiteSpace(selectParam) || !registry.Types.ContainsKey(typeFullName))
+        {
+            return null;
+        }
+
+        var known = GetSelectableMembers(registry, typeFullName);
+        foreach (var name in SplitSelect(selectParam))
+        {
+            // "*", directory extension properties (extension_{appId}_{name}, not in the CSDL),
+            // qualified/derived-type paths and instance annotations are not checked.
+            if (name == "*" ||
+                name.StartsWith("extension_", StringComparison.OrdinalIgnoreCase) ||
+                name.StartsWith('@') ||
+                name.Contains('/', StringComparison.Ordinal) ||
+                name.Contains('.', StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (!known.Contains(name))
+            {
+                return ODataError("BadRequest", $"Could not find a property named '{name}' on type '{typeFullName}'.");
+            }
+        }
+
+        return null;
+    }
+
+    private static HashSet<string> GetSelectableMembers(SchemaRegistry registry, string typeFullName)
+    {
+        if (registry.SelectableMembers.TryGetValue(typeFullName, out var cached))
+        {
+            return cached;
+        }
+
+        var members = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        void AddMembersOf(string type)
+        {
+            members.UnionWith(GetAllProperties(registry, type).Select(p => p.Name));
+            members.UnionWith(GetAllNavigationProperties(registry, type).Select(p => p.Name));
+        }
+
+        AddMembersOf(typeFullName);
+        foreach (var candidate in registry.Types.Keys)
+        {
+            if (IsDerivedFrom(registry, candidate, typeFullName))
+            {
+                AddMembersOf(candidate);
+            }
+        }
+
+        registry.SelectableMembers[typeFullName] = members;
+        return members;
+    }
+
+    private static bool IsDerivedFrom(SchemaRegistry registry, string candidate, string baseType)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var current = candidate;
+        while (seen.Add(current) && registry.Types.TryGetValue(current, out var def) && !string.IsNullOrEmpty(def.BaseType))
+        {
+            current = ResolveRefName(registry, def.BaseType);
+            if (string.Equals(current, baseType, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private static JsonObject? ValidateExpand(SchemaRegistry registry, string typeFullName, MockRequest request, QueryRestrictions? restrictions)
     {
         if (restrictions is null)

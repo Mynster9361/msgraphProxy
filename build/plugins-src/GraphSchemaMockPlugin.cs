@@ -35,6 +35,9 @@ public sealed class GraphSchemaMockPluginConfiguration
     // Reproducibility: seed (same seed + same requests = byte-identical responses), fixedNow,
     // defaultPoolSize and per-type poolSizes. Without a seed, ids stay random as before.
     public GraphMockDeterminismOptions Determinism { get; set; } = new();
+    // Unknown $select names get Graph's 400. Set false for clients that select properties this CSDL
+    // doesn't declare.
+    public bool ValidateSelect { get; set; } = true;
 }
 
 /// <summary>
@@ -91,7 +94,10 @@ public sealed class GraphSchemaMockPlugin(
             }
         }
 
-        _engine = new GraphMockEngine(v1Csdl, betaCsdl, Configuration.SubscribedSkus, Configuration.Paging, Configuration.Determinism);
+        _engine = new GraphMockEngine(v1Csdl, betaCsdl, Configuration.SubscribedSkus, Configuration.Paging, Configuration.Determinism)
+        {
+            ValidateSelectEnabled = Configuration.ValidateSelect,
+        };
         _graphHosts = new GraphHosts(Configuration.AdditionalGraphHosts);
         LogRegistryLoaded("v1.0", schemaFilePath);
         if (betaCsdl is not null)

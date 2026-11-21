@@ -188,6 +188,19 @@ try {
         }
     }
 
+    Test-Check 'GET /users?$select=<unknown property> is rejected like Graph (400)' {
+        $ok = Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/users?$select=id,displayName' -Headers $headers -SkipCertificateCheck -TimeoutSec 15
+        if ($ok.value.Count -lt 1) { throw 'a valid $select should still return users' }
+        try {
+            Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/users?$select=id,notAProperty' -Headers $headers -SkipCertificateCheck -TimeoutSec 15 | Out-Null
+            throw 'expected a 400'
+        } catch [Microsoft.PowerShell.Commands.HttpResponseException] {
+            if ($_.Exception.Response.StatusCode.value__ -ne 400) { throw "expected 400, got $($_.Exception.Response.StatusCode.value__)" }
+            $message = ($_.ErrorDetails.Message | ConvertFrom-Json).error.message
+            if ($message -ne "Could not find a property named 'notAProperty' on type 'microsoft.graph.user'.") { throw "unexpected error message: $message" }
+        }
+    }
+
     Test-Check 'POST .../members/$ref adds a reference (204)' {
         $body = @{ '@odata.id' = 'https://graph.microsoft.com/v1.0/directoryObjects/11111111-1111-1111-1111-111111111111' } | ConvertTo-Json
         $r = Invoke-WebRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/groups/22222222-2222-2222-2222-222222222222/members/`$ref" -Headers $headers -Body $body -ContentType 'application/json' -SkipCertificateCheck -TimeoutSec 15

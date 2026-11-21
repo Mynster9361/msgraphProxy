@@ -15,6 +15,7 @@
 + Add: each `$batch` sub-response has its own `headers` object: `Content-Type` (JSON or text/plain), plus headers the same request would get at the top level, such as `Preference-Applied`.
 + Fix: `$batch` sub-requests used a hard-coded `graph.microsoft.com`, so nextLinks and `@odata.context` inside a US Gov, DoD or China batch pointed at the wrong cloud. They now use the host the batch was sent to.
 + Change: an absolute URL in a `$batch` sub-request now gets its own 400 instead of being quietly re-rooted.
++ Change: `$select` with an unknown property now gets Graph's 400 (`Could not find a property named 'x' on type 'T'.`). Properties of the type, its base types and its derived types are accepted, so polymorphic collections like `members` still work. Matching is case-insensitive, and `*` and `extension_*` names are always allowed. Set `graphSchemaMockPlugin.validateSelect` to `false` for clients that select properties this CSDL doesn't declare.
 + Change: collections with more than 100 items now return 100 per page with a nextLink, like Graph. Before, they returned everything at once.
 + Add: `graphSchemaMockPlugin.additionalGraphHosts` for extra Graph hosts, such as sovereign clouds. They must also be listed in `urlsToWatch`.
 
