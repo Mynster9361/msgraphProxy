@@ -10,14 +10,10 @@ namespace MsGraphProxy.MockEngine;
 /// <summary>
 /// Runs <see cref="GraphMockEngine"/> in-process: plug it into an <see cref="HttpClient"/> and every
 /// request is answered by the engine without a proxy, certificates or network.
-/// Requests the engine doesn't handle get a 404 Graph error; nothing is ever forwarded.
+/// Requests the engine doesn't handle get the strict-mode 404/405; nothing is ever forwarded.
 /// </summary>
 public sealed class GraphMockHttpMessageHandler(GraphMockEngine engine) : HttpMessageHandler
 {
-    // The engine keeps shared, mutable per-type pools and isn't thread-safe yet
-    // (msgraphProxy P0 item #1), so calls are serialized here.
-    private readonly SemaphoreSlim _gate = new(1, 1);
-
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -29,29 +25,9 @@ public sealed class GraphMockHttpMessageHandler(GraphMockEngine engine) : HttpMe
         var body = request.Content is null ? null : await request.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
         var mockRequest = new MockRequest(request.RequestUri, name => GetHeader(request, name), string.IsNullOrEmpty(body) ? null : body);
 
-        MockOutcome outcome;
-        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
-        {
-            outcome = engine.Handle(request.Method.Method, mockRequest);
-        }
-        finally
-        {
-            _gate.Release();
-        }
-
-        if (outcome.Response is not { } response)
-        {
-            var notFound = new HttpResponseMessage(HttpStatusCode.NotFound)
-            {
-                RequestMessage = request,
-                Content = new StringContent(
-                    "{\"error\":{\"code\":\"Request_ResourceNotFound\",\"message\":\"msgraphProxy mock engine: " + outcome.SkipReason + "\"}}",
-                    Encoding.UTF8,
-                    "application/json"),
-            };
-            return notFound;
-        }
+        // The engine is thread-safe, and the handler is always strict: nothing is ever forwarded.
+        var outcome = engine.Handle(request.Method.Method, mockRequest);
+        var response = outcome.Response ?? GraphMockEngine.StrictResponse(outcome.SkipReason!.Value, mockRequest);
 
         var message = new HttpResponseMessage((HttpStatusCode)response.StatusCode)
         {
@@ -71,16 +47,6 @@ public sealed class GraphMockHttpMessageHandler(GraphMockEngine engine) : HttpMe
         }
 
         return message;
-    }
-
-    protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            _gate.Dispose();
-        }
-
-        base.Dispose(disposing);
     }
 
     private static string? GetHeader(HttpRequestMessage request, string name)

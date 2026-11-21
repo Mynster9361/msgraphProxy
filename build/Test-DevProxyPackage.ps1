@@ -140,6 +140,26 @@ try {
         if ($r.id -ne $userId) { throw "expected id $userId, got $($r.id)" }
     }
 
+    # dod-graph.microsoft.us is in the shipped urlsToWatch, but Dev Proxy's IsGraphUrl doesn't match it,
+    # so before GraphHosts these requests went to the real DoD endpoint (a 401 for this fake token).
+    Test-Check 'GET dod-graph.microsoft.us /users is mocked, not forwarded' {
+        $r = Invoke-RestMethod -Uri 'https://dod-graph.microsoft.us/v1.0/users' -Headers $headers -SkipCertificateCheck -TimeoutSec 15
+        if ($r.value.Count -lt 1) { throw "expected at least 1 user, got $($r.value.Count)" }
+        if ($r.'@odata.context' -notlike 'https://dod-graph.microsoft.us/*') { throw "unexpected @odata.context $($r.'@odata.context')" }
+    }
+
+    # Dev Proxy invokes plugins concurrently; the engine's shared pools must survive parallel writes.
+    Test-Check 'parallel POST /groups are all stored (thread safety)' {
+        $before = (Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/groups' -Headers $headers -SkipCertificateCheck -TimeoutSec 15).value.Count
+        $created = 1..24 | ForEach-Object -ThrottleLimit 12 -Parallel {
+            $body = @{ displayName = "parallel-$_"; mailNickname = "parallel$_" } | ConvertTo-Json
+            (Invoke-RestMethod -Method Post -Uri 'https://graph.microsoft.com/v1.0/groups' -Headers $using:headers -Body $body -ContentType 'application/json' -SkipCertificateCheck -TimeoutSec 30).id
+        }
+        if (@($created | Select-Object -Unique).Count -ne 24) { throw "expected 24 distinct created ids, got $(@($created | Select-Object -Unique).Count)" }
+        $after = (Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/groups' -Headers $headers -SkipCertificateCheck -TimeoutSec 15).value.Count
+        if ($after -ne $before + 24) { throw "expected $($before + 24) groups after parallel creates, got $after" }
+    }
+
     Test-Check 'POST .../members/$ref adds a reference (204)' {
         $body = @{ '@odata.id' = 'https://graph.microsoft.com/v1.0/directoryObjects/11111111-1111-1111-1111-111111111111' } | ConvertTo-Json
         $r = Invoke-WebRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/groups/22222222-2222-2222-2222-222222222222/members/`$ref" -Headers $headers -Body $body -ContentType 'application/json' -SkipCertificateCheck -TimeoutSec 15

@@ -23,6 +23,12 @@ public sealed class GraphSchemaMockPluginConfiguration
     // Seeds the subscribedSkus pool from these instead of generic fabrication,
     // when non-empty - see GraphSchemaMockSubscribedSkuConfiguration.
     public IEnumerable<GraphSchemaMockSubscribedSkuConfiguration> SubscribedSkus { get; set; } = [];
+    // Strict mode: a Graph request this plugin can't answer gets a 404/405 Graph error instead of
+    // falling through to the real service, so a test run can never reach a real tenant.
+    public bool Strict { get; set; }
+    // Graph hosts beyond the built-in ones (graph.microsoft.com/.us, dod-graph.microsoft.us,
+    // microsoftgraph.chinacloudapi.cn), e.g. sovereign-cloud endpoints. They must also be in urlsToWatch.
+    public IEnumerable<string> AdditionalGraphHosts { get; set; } = [];
 }
 
 /// <summary>
@@ -45,6 +51,7 @@ public sealed class GraphSchemaMockPlugin(
         pluginConfigurationSection)
 {
     private GraphMockEngine? _engine;
+    private GraphHosts _graphHosts = new();
 
     public override string Name => nameof(GraphSchemaMockPlugin);
 
@@ -79,6 +86,7 @@ public sealed class GraphSchemaMockPlugin(
         }
 
         _engine = new GraphMockEngine(v1Csdl, betaCsdl, Configuration.SubscribedSkus);
+        _graphHosts = new GraphHosts(Configuration.AdditionalGraphHosts);
         LogRegistryLoaded("v1.0", schemaFilePath);
         if (betaCsdl is not null)
         {
@@ -115,9 +123,13 @@ public sealed class GraphSchemaMockPlugin(
         }
 
         var rawRequest = e.Session.HttpClient.Request;
+        if (!_graphHosts.IsGraphUrl(rawRequest.RequestUri))
+        {
+            return Task.CompletedTask;
+        }
+
         var method = rawRequest.Method?.ToUpperInvariant() ?? "";
-        if (method is not ("GET" or "POST" or "PATCH" or "PUT" or "DELETE") ||
-            !ProxyUtils.IsGraphUrl(rawRequest.RequestUri))
+        if (method is not ("GET" or "POST" or "PATCH" or "PUT" or "DELETE") && !Configuration.Strict)
         {
             return Task.CompletedTask;
         }
@@ -128,14 +140,22 @@ public sealed class GraphSchemaMockPlugin(
             rawRequest.HasBody ? rawRequest.BodyString : null);
 
         var outcome = _engine.Handle(method, request);
-        if (outcome.Response is not { } response)
+        var response = outcome.Response;
+        if (response is null)
         {
-            if (outcome.SkipReason == MockSkipReason.NoSchemaMatch)
+            if (Configuration.Strict)
             {
-                Logger.LogRequest("No schema match for this path", MessageType.Skipped, new LoggingContext(e.Session));
+                response = GraphMockEngine.StrictResponse(outcome.SkipReason!.Value, request);
             }
+            else
+            {
+                if (outcome.SkipReason == MockSkipReason.NoSchemaMatch)
+                {
+                    Logger.LogRequest("No schema match for this path", MessageType.Skipped, new LoggingContext(e.Session));
+                }
 
-            return Task.CompletedTask;
+                return Task.CompletedTask;
+            }
         }
 
         e.Session.GenericResponse(

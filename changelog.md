@@ -5,6 +5,10 @@
 + Change: GraphSchemaMockPlugin's mock logic now lives in an engine-agnostic `MockEngine` (build/plugins-src/MockEngine/) with no Dev Proxy dependencies. The plugin is a thin Dev Proxy v3 adapter. Behavior is unchanged; all smoke checks pass.
 + Add: `GraphMockHttpMessageHandler` runs the same engine in-process behind an `HttpClient`, with no proxy, certificates or network.
 + Change: Build-DevProxyPackage.ps1 copies plugin sources recursively so subfolders are compiled.
++ Fix: requests to `dod-graph.microsoft.us` were watched but never mocked, so they went to the real DoD Graph endpoint. Dev Proxy's `IsGraphUrl` doesn't match that host; the new `GraphHosts` registry does.
++ Fix: the mock engine is now thread-safe. Dev Proxy runs plugins concurrently, and parallel writes could be lost. Lookups by id now use an index instead of a linear scan.
++ Add: `graphSchemaMockPlugin.strict` returns a 404/405 Graph error for anything the mock can't answer instead of forwarding it to the real service. Off by default.
++ Add: `graphSchemaMockPlugin.additionalGraphHosts` for extra Graph hosts, such as sovereign clouds. They must also be listed in `urlsToWatch`.
 
 ## 1.1.1 (2026-10-09)
 

@@ -229,7 +229,12 @@ public sealed partial class GraphMockEngine
     // underlying tenant data, just through differently-shaped API surfaces, so a
     // record seeded via one version's schema is reused (and simply missing
     // whichever properties are beta-only/v1.0-only) rather than kept separate.
-    private readonly Dictionary<string, List<JsonObject>> _store = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, EntityPool> _store = new(StringComparer.Ordinal);
+
+    // One lock for the whole engine: pools are shared across types, $batch sub-requests
+    // and $expand, and responses are serialized inside Handle, so request-level
+    // serialization is the simplest correct model. Dev Proxy invokes plugins concurrently.
+    private readonly Lock _gate = new();
 
     /// <param name="v1Csdl">Contents of the v1.0 CSDL.</param>
     /// <param name="betaCsdl">Contents of the beta CSDL, or null to leave /beta/* unmocked.</param>
@@ -260,6 +265,28 @@ public sealed partial class GraphMockEngine
         ArgumentNullException.ThrowIfNull(method);
         ArgumentNullException.ThrowIfNull(request);
 
+        lock (_gate)
+        {
+            return HandleCore(method, request);
+        }
+    }
+
+    /// <summary>
+    /// The response strict mode sends instead of forwarding a request the engine didn't handle,
+    /// so nothing ever reaches the real service. Shapes match what $batch sub-requests already get.
+    /// </summary>
+    public static MockResponse StrictResponse(MockSkipReason reason, MockRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        var result = reason is MockSkipReason.UnsupportedMethod or MockSkipReason.MethodNotSupportedForResource
+            ? new MockResult(ODataError("Request_BadRequest", "Specified HTTP method is not allowed for the request target."), HttpStatusCode.MethodNotAllowed, LogLabel: $"strict: {reason}")
+            : new MockResult(ODataError("Request_ResourceNotFound", $"Resource not found for the segment '{request.RequestUri.AbsolutePath}'."), HttpStatusCode.NotFound, LogLabel: $"strict: {reason}");
+        return ToResponse(result, request);
+    }
+
+    private MockOutcome HandleCore(string method, MockRequest request)
+    {
         method = method.ToUpperInvariant();
         if (method is not ("GET" or "POST" or "PATCH" or "PUT" or "DELETE"))
         {
@@ -702,7 +729,7 @@ public sealed partial class GraphMockEngine
     private (JsonNode? Body, HttpStatusCode? StatusCode) HandleItem(SchemaRegistry registry, string versionSegment, string typeFullName, string itemId, string method, MockRequest request, QueryRestrictions? restrictions)
     {
         var pool = GetOrSeedPool(registry, typeFullName);
-        var existing = FindById(pool, itemId);
+        var existing = pool.FindById(itemId);
 
         // unifiedRoleManagementAlert is unlike every other by-id entity here: its
         // ids aren't arbitrary keys of user-created resources, they're a small,
@@ -754,6 +781,7 @@ public sealed partial class GraphMockEngine
                     if (bodyObj is not null)
                     {
                         MergeInto(existing, bodyObj);
+                        pool.Reindex();
                     }
 
                     return (existing.DeepClone(), HttpStatusCode.OK);
@@ -999,7 +1027,7 @@ public sealed partial class GraphMockEngine
         return selectParam is not null ? SplitSelect(selectParam) : DefaultProps(registry, typeFullName);
     }
 
-    private List<JsonObject> GetOrSeedPool(SchemaRegistry registry, string typeFullName)
+    private EntityPool GetOrSeedPool(SchemaRegistry registry, string typeFullName)
     {
         if (_store.TryGetValue(typeFullName, out var pool))
         {
@@ -1010,8 +1038,9 @@ public sealed partial class GraphMockEngine
             ? SeedSubscribedSkuPool(registry, _subscribedSkus)
             : SeedGenericPool(registry, typeFullName);
 
-        _store[typeFullName] = seeded;
-        return seeded;
+        var created = new EntityPool(seeded);
+        _store[typeFullName] = created;
+        return created;
     }
 
     private static List<JsonObject> SeedGenericPool(SchemaRegistry registry, string typeFullName)
@@ -1066,22 +1095,6 @@ public sealed partial class GraphMockEngine
 
         entity["servicePlans"] = servicePlans;
         return entity;
-    }
-
-    private static JsonObject? FindById(List<JsonObject> pool, string id)
-    {
-        foreach (var item in pool)
-        {
-            if (item.TryGetPropertyValue("id", out var idNode) &&
-                idNode is JsonValue idValue &&
-                idValue.TryGetValue(out string? idStr) &&
-                string.Equals(idStr, id, StringComparison.Ordinal))
-            {
-                return item;
-            }
-        }
-
-        return null;
     }
 
     private static JsonObject? ParseBody(MockRequest request)
@@ -2473,4 +2486,74 @@ public readonly record struct MockOutcome(MockResponse? Response, MockSkipReason
     public static MockOutcome Respond(MockResponse response) => new(response, null);
 
     public static MockOutcome NotHandled(MockSkipReason reason) => new(null, reason);
+}
+
+/// <summary>
+/// One type's records: insertion-ordered like the List it replaces, plus an ordinal id index so
+/// by-id lookups are O(1). Duplicate ids keep list semantics (the first one in order wins).
+/// Not thread-safe on its own; GraphMockEngine serializes all access.
+/// </summary>
+internal sealed class EntityPool : IEnumerable<JsonObject>
+{
+    private readonly List<JsonObject> _items;
+    private readonly Dictionary<string, JsonObject> _byId = new(StringComparer.Ordinal);
+
+    public EntityPool(IEnumerable<JsonObject> items)
+    {
+        _items = [.. items];
+        Reindex();
+    }
+
+    public int Count => _items.Count;
+
+    public JsonObject this[int index] => _items[index];
+
+    public void Add(JsonObject item)
+    {
+        _items.Add(item);
+        if (GetId(item) is { } id)
+        {
+            _ = _byId.TryAdd(id, item);
+        }
+    }
+
+    public bool Remove(JsonObject item)
+    {
+        if (!_items.Remove(item))
+        {
+            return false;
+        }
+
+        if (GetId(item) is { } id && _byId.TryGetValue(id, out var indexed) && ReferenceEquals(indexed, item))
+        {
+            // Another record may share the id; the next one in order now wins.
+            Reindex();
+        }
+
+        return true;
+    }
+
+    public JsonObject? FindById(string id) => _byId.GetValueOrDefault(id);
+
+    /// <summary>Rebuilds the index, e.g. after a PATCH/PUT body changed a record's id.</summary>
+    public void Reindex()
+    {
+        _byId.Clear();
+        foreach (var item in _items)
+        {
+            if (GetId(item) is { } id)
+            {
+                _ = _byId.TryAdd(id, item);
+            }
+        }
+    }
+
+    public IEnumerator<JsonObject> GetEnumerator() => _items.GetEnumerator();
+
+    System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+
+    private static string? GetId(JsonObject item) =>
+        item.TryGetPropertyValue("id", out var idNode) && idNode is JsonValue idValue && idValue.TryGetValue(out string? idStr)
+            ? idStr
+            : null;
 }
