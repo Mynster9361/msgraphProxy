@@ -130,6 +130,15 @@ internal sealed class FaultGate(GraphMockFaultOptions options, MockClock clock)
     private readonly Dictionary<string, DateTimeOffset> _blockedUntil = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> _ruleHits = new(StringComparer.Ordinal);
     private Dictionary<string, int>? _batchMailboxCounts;
+
+    // Retry-After violations count only requests the client sent after it could have seen the 429: every request
+    // gets an arrival number when it reaches the engine, and a block becomes visible once the response that set it
+    // completes. Requests already in flight then (the rest of the same $batch, parallel requests) are throttled
+    // but are not violations.
+    private readonly Dictionary<string, long> _visibleAfter = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _blockedThisRequest = new(StringComparer.Ordinal);
+    private long _arrivals;
+    private long _currentArrival;
     private long _requests;
     private long _subRequests;
     private long _nonGet;
@@ -155,6 +164,8 @@ internal sealed class FaultGate(GraphMockFaultOptions options, MockClock clock)
         _ruleState.Clear();
         _buckets.Clear();
         _blockedUntil.Clear();
+        _visibleAfter.Clear();
+        _blockedThisRequest.Clear();
         _ruleHits.Clear();
         _requests = _subRequests = _nonGet = _throttled = _faults = _violations = 0;
     }
@@ -192,6 +203,30 @@ internal sealed class FaultGate(GraphMockFaultOptions options, MockClock clock)
         }
 
         return null;
+    }
+
+    // --- request scope -------------------------------------------------------------------------
+
+    /// <summary>Numbers a request on arrival, before it waits for the engine lock (thread-safe).</summary>
+    public long Arrive() => Interlocked.Increment(ref _arrivals);
+
+    /// <summary>Starts serving a request that arrived as <paramref name="arrival"/> (under the engine lock).</summary>
+    public void BeginRequest(long arrival)
+    {
+        _currentArrival = arrival;
+        _blockedThisRequest.Clear();
+    }
+
+    /// <summary>The response is complete: blocks it set are now visible to the client.</summary>
+    public void EndRequest()
+    {
+        var latest = Interlocked.Read(ref _arrivals);
+        foreach (var key in _blockedThisRequest)
+        {
+            _visibleAfter[key] = latest;
+        }
+
+        _blockedThisRequest.Clear();
     }
 
     // --- batch scope ---------------------------------------------------------------------------
@@ -239,6 +274,11 @@ internal sealed class FaultGate(GraphMockFaultOptions options, MockClock clock)
         {
             if (_blockedUntil.TryGetValue(key, out var until) && now < until)
             {
+                if (!_visibleAfter.TryGetValue(key, out var visibleAfter) || _currentArrival <= visibleAfter)
+                {
+                    return Throttle("TooManyRequests", "Throttled; this request was sent before the Retry-After reached the client.", SecondsUntil(until, now), key, now, alreadyBlocked: true);
+                }
+
                 _violations++;
                 return Throttle("TooManyRequests", "Retry-After was not honored; the client retried before it elapsed.", SecondsUntil(until, now), key, now, alreadyBlocked: true);
             }
@@ -275,6 +315,7 @@ internal sealed class FaultGate(GraphMockFaultOptions options, MockClock clock)
             if (rule.RetryAfterSeconds is { } retry)
             {
                 _blockedUntil["rule:" + name + "|" + (mailbox ?? "")] = now.AddSeconds(retry);
+                MarkBlocked("rule:" + name + "|" + (mailbox ?? ""));
             }
 
             if (status == 429)
@@ -361,9 +402,16 @@ internal sealed class FaultGate(GraphMockFaultOptions options, MockClock clock)
         if (!alreadyBlocked)
         {
             _blockedUntil[key] = now.AddSeconds(retryAfter);
+            MarkBlocked(key);
         }
 
         return new FaultDecision(429, code, message, retryAfter);
+    }
+
+    private void MarkBlocked(string key)
+    {
+        _ = _visibleAfter.Remove(key);
+        _ = _blockedThisRequest.Add(key);
     }
 
     private IEnumerable<string> BlockKeysFor(string relativePath, string? mailbox, string app)

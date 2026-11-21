@@ -319,6 +319,7 @@ public sealed partial class GraphMockEngine
             return MockOutcome.Respond(HandleControl(method, request));
         }
 
+        var arrival = _faults.Arrive();
         var mailbox = FaultGate.MailboxKeyFor(RelativePath(request.RequestUri));
         _faults.Enter(mailbox);
         try
@@ -326,7 +327,15 @@ public sealed partial class GraphMockEngine
             lock (_gate)
             {
                 using var ambient = MockAmbient.Enter(_entropy, Clock);
-                return HandleCore(method, request);
+                _faults.BeginRequest(arrival);
+                try
+                {
+                    return HandleCore(method, request);
+                }
+                finally
+                {
+                    _faults.EndRequest();
+                }
             }
         }
         finally
@@ -349,6 +358,7 @@ public sealed partial class GraphMockEngine
             return MockOutcome.Respond(HandleControl(method, request));
         }
 
+        var arrival = _faults.Arrive();
         var relativePath = RelativePath(request.RequestUri);
         var mailbox = FaultGate.MailboxKeyFor(relativePath);
         _faults.Enter(mailbox);
@@ -368,7 +378,15 @@ public sealed partial class GraphMockEngine
             lock (_gate)
             {
                 using var ambient = MockAmbient.Enter(_entropy, Clock);
-                return HandleCore(method, request);
+                _faults.BeginRequest(arrival);
+                try
+                {
+                    return HandleCore(method, request);
+                }
+                finally
+                {
+                    _faults.EndRequest();
+                }
             }
         }
         finally
